@@ -1,0 +1,14 @@
+# 本地数据（含中转站与官方 Key，切勿提交）
+data/
+.venv/
+__pycache__/
+*.pyc
+
+# 本地凭据与数据库备份，避免泄露 Key
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite3

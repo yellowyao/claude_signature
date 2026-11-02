@@ -1,0 +1,712 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude 签名检测</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23c9643f' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+<script>
+  // apply the saved theme before first paint
+  try { const t = localStorage.getItem('theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+<div id="app" v-cloak>
+<div class="shell">
+
+  <!-- ============================================================ sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark"><ui-icon name="shieldCheck" :size="19" :stroke="2.2"></ui-icon></div>
+      <div>
+        <div class="brand-title">签名检测</div>
+        <div class="brand-sub">Claude 中转站真伪校验</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a href="#/" :class="{active: s.route.name==='overview'}"><ui-icon name="home"></ui-icon><span class="lbl">总览</span>
+        <span v-if="s.overview?.totals.running" class="count">{{ s.overview.totals.running }}</span></a>
+      <a href="#/new" :class="{active: s.route.name==='new'}"><ui-icon name="play"></ui-icon><span class="lbl">发起检测</span></a>
+      <a href="#/records" :class="{active: ['records','record','task'].includes(s.route.name)}"><ui-icon name="list"></ui-icon><span class="lbl">检测记录</span></a>
+      <div class="nav-label">配置</div>
+      <a href="#/relays" :class="{active: s.route.name==='relays'}"><ui-icon name="server"></ui-icon><span class="lbl">中转站</span></a>
+      <a href="#/keys" :class="{active: s.route.name==='keys'}"><ui-icon name="key"></ui-icon><span class="lbl">官方 Key 与设置</span></a>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="theme-switch">
+        <button :class="{on: s.theme==='light'}" @click="s.theme='light'" title="浅色"><ui-icon name="sun" :size="15"></ui-icon></button>
+        <button :class="{on: s.theme==='system'}" @click="s.theme='system'" title="跟随系统"><ui-icon name="monitor" :size="15"></ui-icon></button>
+        <button :class="{on: s.theme==='dark'}" @click="s.theme='dark'" title="深色"><ui-icon name="moon" :size="15"></ui-icon></button>
+      </div>
+      <div class="foot-note">数据与 Key 仅保存在本机<br>data/signature.db</div>
+    </div>
+  </aside>
+
+  <main class="main">
+
+  <!-- ============================================================ overview -->
+  <div v-if="s.route.name==='overview' && s.overview" class="page">
+    <div class="page-head">
+      <div>
+        <h1>总览</h1>
+        <p>用官方 API 校验中转站返回的 thinking 签名，识别掺假与模型替换</p>
+      </div>
+      <div class="actions">
+        <button class="btn" @click="go('/relays')"><ui-icon name="plus"></ui-icon>添加中转站</button>
+        <button class="btn primary" @click="go('/new')" :disabled="!s.overview.cards.length"><ui-icon name="play"></ui-icon>发起检测</button>
+      </div>
+    </div>
+
+    <div v-if="s.overview.totals.running" class="banner">
+      <span class="spinner"></span>有 {{ s.overview.totals.running }} 个检测任务正在运行
+      <a href="#/records?tab=tasks" @click="s.recTab='tasks'">查看进度</a>
+    </div>
+
+    <template v-if="s.overview.cards.length && hasKey">
+      <div class="stats">
+        <div class="card stat"><div class="label"><ui-icon name="server" :size="14"></ui-icon>中转站</div><div class="value">{{ s.overview.totals.relays }}</div></div>
+        <div class="card stat"><div class="label"><ui-icon name="activity" :size="14"></ui-icon>检测次数</div><div class="value">{{ s.overview.totals.records || 0 }}<small>项</small></div></div>
+        <div class="card stat" :class="{alert: s.overview.totals.forged}"><div class="label"><ui-icon name="shieldX" :size="14"></ui-icon>发现掺假</div><div class="value">{{ s.overview.totals.forged || 0 }}</div></div>
+        <div class="card stat" :class="{warn: s.overview.totals.suspicious}"><div class="label"><ui-icon name="alert" :size="14"></ui-icon>可疑</div><div class="value">{{ s.overview.totals.suspicious || 0 }}</div></div>
+        <div class="card stat tip" :data-tip="'中转站侧按官方价折算 ' + money(s.overview.totals.cost_relay)"><div class="label"><ui-icon name="dollar" :size="14"></ui-icon>官方花费</div><div class="value">{{ money(s.overview.totals.cost_official) }}</div></div>
+      </div>
+
+      <div class="relay-grid">
+        <div v-for="c in s.overview.cards" :key="c.relay.id" class="card relay-card">
+          <div class="row">
+            <div class="avatar" :style="{background: avatarColor(c.relay.name)}">{{ c.relay.name.slice(0,1).toUpperCase() }}</div>
+            <div class="grow" style="min-width:0">
+              <div class="title">{{ c.relay.name }}</div>
+              <div class="host">{{ host(c.relay.base_url) }}</div>
+            </div>
+            <button class="btn sm" @click="go('/new?relay=' + c.relay.id)"><ui-icon name="play" :size="14"></ui-icon>检测</button>
+          </div>
+          <div class="model-row">
+            <component v-for="m in s.meta.models" :key="m.id" :is="c.latest[m.id] ? 'a' : 'div'"
+              :href="c.latest[m.id] ? '#/records/' + c.latest[m.id].id : undefined"
+              class="model-cell tip" :class="c.latest[m.id] ? 'v-' + c.latest[m.id].verdict : 'v-none'"
+              :data-tip="c.latest[m.id] ? reasonText(c.latest[m.id].reason) : '尚未检测'">
+              <span class="m">{{ modelName(m.id) }}</span>
+              <span class="v">{{ c.latest[m.id] ? VERDICTS[c.latest[m.id].verdict]?.label : '—' }}</span>
+            </component>
+          </div>
+          <div>
+            <div class="row small" style="justify-content:space-between;margin-bottom:6px">
+              <span class="muted">通过率（已出结论 {{ c.stats.decided || 0 }} 项）</span><b>{{ passRate(c.stats) }}</b>
+            </div>
+            <div class="meter"><span v-for="(p,i) in meterParts(c.stats)" :key="i" :style="{width: p.w + '%', background: p.c}"></span></div>
+          </div>
+          <div class="foot">
+            <span>{{ relTime(c.stats.last_at) }}</span>
+            <span class="grow"></span>
+            <a :href="'#/records'" @click="s.recFilter.relay_id = c.relay.id; s.recTab='records'" class="row" style="gap:4px">全部记录<ui-icon name="chevron" :size="14"></ui-icon></a>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <div v-else class="card empty">
+      <div class="icon-wrap"><ui-icon name="shieldCheck" :size="26"></ui-icon></div>
+      <h3>三步开始检测</h3>
+      <p>先存一个官方 API Key 用来校验签名，再添加要检测的中转站，然后发起检测。</p>
+      <div class="steps" style="max-width:760px;margin:0 auto">
+        <a href="#/keys" class="step" :class="{done: hasKey}"><span class="n">{{ hasKey ? '✓' : 1 }}</span><b>添加官方 Key</b><span>用于回放校验与对照实验，只保存在本机</span></a>
+        <a href="#/relays" class="step" :class="{done: s.overview.cards.length}"><span class="n">{{ s.overview.cards.length ? '✓' : 2 }}</span><b>添加中转站</b><span>填写 URL 与 Key，可配置模型名映射</span></a>
+        <a href="#/new" class="step"><span class="n">3</span><b>发起检测</b><span>多选中转站和模型，实时查看结果</span></a>
+      </div>
+    </div>
+
+    <div class="section-title"><ui-icon name="info" :size="15"></ui-icon>判定说明</div>
+    <div class="card legend">
+      <div v-for="(v, k) in VERDICTS" :key="k"><span><span class="badge" :class="'v-' + k"><span class="dot"></span>{{ v.label }}</span></span>{{ v.desc }}</div>
+    </div>
+  </div>
+
+  <!-- ============================================================ new task -->
+  <div v-if="s.route.name==='new'" class="page">
+    <div class="page-head">
+      <div><h1>发起检测</h1><p>每项检测：中转站铸造带签名的 thinking 块 → 官方回放校验，并自动运行阳性与阴性对照</p></div>
+    </div>
+
+    <div v-if="!s.relays.length || !s.keys.length" class="banner warn">
+      <ui-icon name="alert"></ui-icon>
+      {{ !s.keys.length ? '还没有官方 Key，无法校验签名。' : '还没有添加中转站。' }}
+      <a :href="!s.keys.length ? '#/keys' : '#/relays'">去添加</a>
+    </div>
+
+    <div class="new-layout">
+      <div class="stack">
+        <div class="card">
+          <div class="card-head">
+            <div><h3>选择中转站</h3><div class="sub">已选 {{ s.newTask.relay_ids.length }} / {{ s.relays.length }}</div></div>
+            <button class="btn sm ghost" v-if="s.relays.length" @click="s.newTask.relay_ids = s.newTask.relay_ids.length === s.relays.length ? [] : s.relays.map(r => r.id)">
+              {{ s.newTask.relay_ids.length === s.relays.length ? '取消全选' : '全选' }}</button>
+          </div>
+          <div class="card-pad">
+            <div class="pick-grid">
+              <div v-for="r in s.relays" :key="r.id" class="pick" :class="{on: s.newTask.relay_ids.includes(r.id)}" @click="toggle(s.newTask.relay_ids, r.id)">
+                <span class="check"><ui-icon v-if="s.newTask.relay_ids.includes(r.id)" name="check" :size="12" :stroke="3"></ui-icon></span>
+                <div style="min-width:0">
+                  <div class="t">{{ r.name }}</div>
+                  <div class="d">{{ host(r.base_url) }}</div>
+                  <div class="row wrap" style="gap:5px;margin-top:6px">
+                    <span class="chip" v-if="r.stream">流式</span>
+                    <span class="chip" v-if="Object.keys(r.model_map).length">映射 {{ Object.keys(r.model_map).length }}</span>
+                  </div>
+                </div>
+              </div>
+              <a v-if="!s.relays.length" href="#/relays" class="pick" style="justify-content:center;color:var(--text-3)"><ui-icon name="plus"></ui-icon>添加中转站</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><div><h3>选择模型</h3><div class="sub">回放时使用官方模型名；中转站上的名字在中转站配置里映射</div></div></div>
+          <div class="card-pad">
+            <div class="pick-grid">
+              <div v-for="m in s.meta.models" :key="m.id" class="pick" :class="{on: s.newTask.models.includes(m.id)}" @click="toggle(s.newTask.models, m.id)">
+                <span class="check"><ui-icon v-if="s.newTask.models.includes(m.id)" name="check" :size="12" :stroke="3"></ui-icon></span>
+                <div style="min-width:0">
+                  <div class="t">{{ m.name }}</div>
+                  <div class="d mono">{{ m.id }}</div>
+                  <div class="price">${{ m.input }} / ${{ m.output }} 每百万 token</div>
+                  <div class="warn-note" v-if="m.note">{{ m.note }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h3>参数</h3></div>
+          <div class="card-pad form-grid">
+            <div class="field">
+              <label>每项轮数</label>
+              <div class="row">
+                <div class="stepper">
+                  <button @click="s.newTask.rounds = Math.max(1, s.newTask.rounds - 1)">−</button>
+                  <span>{{ s.newTask.rounds }}</span>
+                  <button @click="s.newTask.rounds = Math.min(10, s.newTask.rounds + 1)">+</button>
+                </div>
+              </div>
+              <span class="hint">怀疑按比例掺假时调高轮数</span>
+            </div>
+            <div class="field">
+              <label>请求方式</label>
+              <div class="seg">
+                <button v-for="(v,k) in STREAM_MODE" :key="k" :class="{on: s.newTask.stream_mode===k}" @click="s.newTask.stream_mode=k">{{ v }}</button>
+              </div>
+              <span class="hint">流式与非流式可能走不同线路</span>
+            </div>
+            <div class="field">
+              <label>官方 Key</label>
+              <select class="select" v-model="s.newTask.official_key_id">
+                <option v-for="k in s.keys" :key="k.id" :value="k.id">{{ k.name }}{{ k.is_default ? '（默认）' : '' }}</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card card-pad summary">
+        <div class="muted small">检测项</div>
+        <div class="row" style="align-items:baseline;gap:6px;margin:6px 0 4px"><span class="big">{{ nt.cells }}</span><span class="muted">项</span></div>
+        <div class="muted small">{{ s.newTask.relay_ids.length }} 个中转站 × {{ s.newTask.models.length }} 个模型 × {{ s.newTask.rounds }} 轮</div>
+        <div class="divider"></div>
+        <div class="line"><span class="muted">官方 API 请求</span><b>≈ {{ nt.cells ? nt.official : 0 }}</b></div>
+        <div class="line"><span class="muted">中转站请求</span><b>≈ {{ nt.relay }}</b></div>
+        <div class="line"><span class="muted">阳性对照</span><span>每个模型 1 次</span></div>
+        <div class="line"><span class="muted">阴性对照</span><span>每项 1 次</span></div>
+        <div class="divider"></div>
+        <button class="btn primary lg" style="width:100%" :disabled="!canStart" @click="confirmStart"><ui-icon name="play"></ui-icon>开始检测</button>
+        <p class="muted small" style="margin:12px 0 0">花费按官方返回的实际 usage 统计，可在记录中查看。</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ task detail -->
+  <div v-if="s.route.name==='task' && s.task && taskView" class="page">
+    <div class="crumb"><a href="#/records?tab=tasks" @click="s.recTab='tasks'">检测记录</a><ui-icon name="chevron" :size="13"></ui-icon>任务 #{{ s.task.id }}</div>
+    <div class="page-head">
+      <div>
+        <h1 class="row" style="gap:12px">任务 #{{ s.task.id }}
+          <span v-if="s.task.status==='running'" class="chip run"><span class="spinner" style="width:10px;height:10px"></span>运行中</span>
+          <span v-else-if="s.task.status==='done'" class="chip ok">已完成</span>
+          <span v-else class="chip warn">已中断</span>
+        </h1>
+        <p>{{ fmtTime(s.task.created_at) }} 发起</p>
+      </div>
+      <div class="actions">
+        <button class="btn" @click="rerun" :disabled="s.task.status==='running'"><ui-icon name="refresh"></ui-icon>再测一次</button>
+      </div>
+    </div>
+
+    <div class="card card-pad" style="margin-bottom:16px">
+      <div class="row" style="justify-content:space-between;margin-bottom:10px">
+        <b>进度 {{ taskView.done }} / {{ taskView.total }}</b>
+        <div class="row wrap" style="gap:6px">
+          <span v-for="(n, v) in taskView.counts" :key="v" class="badge" :class="'v-' + v"><span class="dot"></span>{{ VERDICTS[v]?.label }} {{ n }}</span>
+        </div>
+      </div>
+      <div class="progress"><span :style="{width: taskView.pct + '%'}"></span></div>
+      <div class="meta-row" style="margin-top:18px">
+        <div><span class="k">官方 Key</span><span class="v">{{ s.task.official_key_name }}</span></div>
+        <div><span class="k">每项轮数</span><span class="v">{{ s.task.rounds }}</span></div>
+        <div><span class="k">请求方式</span><span class="v">{{ STREAM_MODE[s.task.stream_mode] }}</span></div>
+        <div><span class="k">官方花费</span><span class="v">{{ money(taskView.cost) }}</span></div>
+        <div><span class="k">中转站花费（官方价折算）</span><span class="v">{{ money(taskView.costRelay) }}</span></div>
+      </div>
+    </div>
+
+    <div class="section-title"><ui-icon name="flask" :size="15"></ui-icon>阳性对照（官方铸造 → 官方回放）</div>
+    <div class="control-strip">
+      <div v-for="m in s.task.models" :key="m" class="control">
+        <template v-if="!controlFor(m) || controlFor(m).status !== 'done'">
+          <div class="ic v-running"><span class="spinner"></span></div>
+          <div><div class="t">{{ modelName(m) }}</div><div class="d">运行中…</div></div>
+        </template>
+        <template v-else>
+          <div class="ic" :class="controlFor(m).ok ? 'v-pass' : 'v-forged'"><ui-icon :name="controlFor(m).ok ? 'check' : 'x'" :size="15" :stroke="2.6"></ui-icon></div>
+          <div style="min-width:0"><div class="t">{{ modelName(m) }} · {{ controlFor(m).ok ? '通过' : '失败' }}</div>
+            <div class="d">{{ controlFor(m).ok ? '官方 Key 与回放逻辑正常' : reasonText(controlFor(m).reason) }}</div></div>
+        </template>
+      </div>
+    </div>
+
+    <div class="section-title"><ui-icon name="server" :size="15"></ui-icon>检测结果</div>
+    <div class="card table-wrap">
+      <table class="matrix">
+        <thead><tr><th style="width:200px">中转站</th><th v-for="m in s.task.models" :key="m">{{ modelName(m) }}</th></tr></thead>
+        <tbody>
+          <tr v-for="row in taskView.rows" :key="row.id">
+            <td>
+              <div class="row">
+                <div class="avatar" style="width:30px;height:30px;font-size:13px;border-radius:9px" :style="{background: avatarColor(row.name)}">{{ row.name.slice(0,1).toUpperCase() }}</div>
+                <div style="min-width:0"><div class="relay-name">{{ row.name }}<span v-if="row.deleted" class="deleted-tag">已删除</span></div><div class="muted small mono">{{ host(row.url) }}</div></div>
+              </div>
+            </td>
+            <td v-for="m in s.task.models" :key="m">
+              <component v-if="row.cells[m]" :is="row.cells[m].status==='done' ? 'a' : 'div'" class="cell-btn"
+                :href="row.cells[m].status==='done' ? '#/records/' + row.cells[m].id : undefined">
+                <verdict-badge :v="row.cells[m].verdict" :status="row.cells[m].status"></verdict-badge>
+                <span v-if="row.cells[m].status==='done'" class="reason">{{ reasonText(row.cells[m].reason) }}</span>
+                <span v-else-if="row.cells[m].relay_model !== m" class="reason mono">{{ row.cells[m].relay_model }}</span>
+              </component>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ============================================================ records -->
+  <div v-if="s.route.name==='records'" class="page">
+    <div class="page-head">
+      <div><h1>检测记录</h1><p>所有检测结果永久保存在本地，可导出为 JSON 作为证据</p></div>
+      <button class="btn primary" @click="go('/new')"><ui-icon name="play"></ui-icon>发起检测</button>
+    </div>
+    <div class="tabs">
+      <button :class="{on: s.recTab==='records'}" @click="s.recTab='records'">检测记录</button>
+      <button :class="{on: s.recTab==='tasks'}" @click="s.recTab='tasks'">任务</button>
+    </div>
+
+    <div v-if="s.recTab==='records'" class="card">
+      <div class="filters">
+        <select class="select" v-model="s.recFilter.relay_id">
+          <option value="">全部中转站</option>
+          <option v-for="r in s.relays" :key="r.id" :value="r.id">{{ r.name }}</option>
+        </select>
+        <select class="select" v-model="s.recFilter.model">
+          <option value="">全部模型</option>
+          <option v-for="m in s.meta.models" :key="m.id" :value="m.id">{{ m.name }}</option>
+        </select>
+        <select class="select" v-model="s.recFilter.verdict">
+          <option value="">全部判定</option>
+          <option v-for="(v,k) in VERDICTS" :key="k" :value="k">{{ v.label }}</option>
+        </select>
+        <span class="grow"></span>
+        <span class="muted small">共 {{ s.records.total }} 条</span>
+      </div>
+      <div class="table-wrap">
+        <table class="table" v-if="s.records.items.length">
+          <thead><tr><th>时间</th><th>中转站</th><th>模型</th><th>判定</th><th>原因</th><th class="num">官方花费</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="r in s.records.items" :key="r.id" class="click" @click="go('/records/' + r.id)">
+              <td class="muted small" style="white-space:nowrap">{{ fmtTime(r.finished_at || r.created_at) }}</td>
+              <td><b>{{ r.relay_name }}</b><span v-if="r.relay_deleted" class="deleted-tag">已删除</span></td>
+              <td style="white-space:nowrap">{{ modelName(r.model) }}<div v-if="r.relay_model !== r.model" class="muted small mono">{{ r.relay_model }}</div></td>
+              <td><verdict-badge :v="r.verdict"></verdict-badge></td>
+              <td class="small" style="color:var(--text-2);max-width:340px">{{ reasonText(r.reason) }}</td>
+              <td class="num small">{{ money(r.cost_official) }}</td>
+              <td style="text-align:right"><button class="btn icon sm ghost" @click.stop="deleteRecord(r)" title="删除"><ui-icon name="trash" :size="14"></ui-icon></button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty"><div class="icon-wrap"><ui-icon name="list" :size="24"></ui-icon></div><h3>暂无记录</h3><p>发起一次检测后，结果会出现在这里。</p></div>
+      </div>
+      <div class="pager" v-if="s.records.total > 20">
+        <span>{{ pageInfo.from }}–{{ pageInfo.to }} / {{ pageInfo.total }}</span>
+        <div class="actions"><button class="btn sm" :disabled="!pageInfo.prev" @click="page(-1)">上一页</button><button class="btn sm" :disabled="!pageInfo.next" @click="page(1)">下一页</button></div>
+      </div>
+    </div>
+
+    <div v-if="s.recTab==='tasks'" class="card">
+      <div class="table-wrap">
+        <table class="table" v-if="s.tasks.length">
+          <thead><tr><th>任务</th><th>时间</th><th>状态</th><th>模型</th><th>中转站</th><th>结果</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="t in s.tasks" :key="t.id" class="click" @click="go('/tasks/' + t.id)">
+              <td><b>#{{ t.id }}</b></td>
+              <td class="muted small" style="white-space:nowrap">{{ fmtTime(t.created_at) }}</td>
+              <td>
+                <span v-if="t.status==='running'" class="chip run"><span class="spinner" style="width:10px;height:10px"></span>运行中</span>
+                <span v-else-if="t.status==='done'" class="chip ok">已完成</span>
+                <span v-else class="chip warn">已中断</span>
+              </td>
+              <td class="small">{{ t.models.map(modelName).join('、') }}</td>
+              <td class="small">{{ t.relay_ids.length }} 个</td>
+              <td><div class="row wrap" style="gap:5px">
+                <span v-for="(n, v) in t.counts" :key="v" class="badge" :class="v==='running' ? 'v-running' : 'v-' + v" style="height:22px;font-size:11.5px"><span class="dot"></span>{{ v==='running' ? '进行中' : VERDICTS[v]?.label }} {{ n }}</span>
+              </div></td>
+              <td style="text-align:right"><button class="btn icon sm ghost" @click.stop="deleteTask(t)" :disabled="t.status==='running'" title="删除"><ui-icon name="trash" :size="14"></ui-icon></button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="empty"><div class="icon-wrap"><ui-icon name="list" :size="24"></ui-icon></div><h3>暂无任务</h3><p>发起一次检测后，任务会出现在这里。</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ record detail -->
+  <div v-if="s.route.name==='record' && s.record" class="page">
+    <div class="crumb"><a href="#/records">检测记录</a><ui-icon name="chevron" :size="13"></ui-icon><a :href="'#/tasks/' + s.record.task_id">任务 #{{ s.record.task_id }}</a><ui-icon name="chevron" :size="13"></ui-icon>记录 #{{ s.record.id }}</div>
+    <div class="page-head">
+      <div><h1>{{ s.record.relay_name }}<span v-if="s.record.relay_deleted" class="deleted-tag" style="font-size:12px;vertical-align:middle">已删除的中转站</span></h1>
+        <p>{{ modelName(s.record.model) }} · {{ fmtTime(s.record.finished_at || s.record.created_at) }}</p></div>
+      <div class="actions">
+        <a class="btn" :href="'/api/records/' + s.record.id + '/export'"><ui-icon name="download"></ui-icon>导出 JSON</a>
+        <button class="btn danger" @click="deleteRecord(s.record, true)" :disabled="s.record.status !== 'done'"><ui-icon name="trash"></ui-icon>删除</button>
+      </div>
+    </div>
+
+    <div class="card hero" :style="{'--hero-c': heroColor(s.record.verdict)}">
+      <div class="hero-icon" :class="s.record.status==='done' ? 'v-' + s.record.verdict : 'v-running'">
+        <span v-if="s.record.status !== 'done'" class="spinner" style="width:22px;height:22px"></span>
+        <ui-icon v-else :name="VERDICTS[s.record.verdict]?.icon" :size="28"></ui-icon>
+      </div>
+      <div class="grow">
+        <h2>{{ s.record.status==='done' ? VERDICTS[s.record.verdict]?.label : '检测进行中' }}</h2>
+        <p>{{ s.record.status==='done' ? reasonText(s.record.reason) : STATUS[s.record.status] }}</p>
+      </div>
+    </div>
+
+    <div class="card kv" style="margin-top:16px">
+      <div><div class="k">中转站地址</div><div class="v mono small">{{ s.record.relay_url }}</div></div>
+      <div><div class="k">模型（官方 / 中转站）</div><div class="v small"><span class="mono">{{ s.record.model }}</span><span v-if="s.record.relay_model !== s.record.model" class="muted"> / <span class="mono">{{ s.record.relay_model }}</span></span></div></div>
+      <div><div class="k">请求方式</div><div class="v">{{ s.record.stream ? '流式' : '非流式' }}</div></div>
+      <div><div class="k">官方 Key</div><div class="v">{{ s.record.task?.official_key_name || '—' }}</div></div>
+      <div><div class="k">轮数</div><div class="v">{{ s.record.rounds.length }}</div></div>
+      <div><div class="k">官方花费</div><div class="v">{{ money(s.record.cost_official) }}</div></div>
+      <div><div class="k">中转站花费（官方价折算）</div><div class="v">{{ money(s.record.cost_relay) }}</div></div>
+      <div><div class="k">任务</div><div class="v"><a :href="'#/tasks/' + s.record.task_id" style="color:var(--accent)">#{{ s.record.task_id }}</a></div></div>
+    </div>
+
+    <div class="section-title"><ui-icon name="flask" :size="15"></ui-icon>对照实验</div>
+    <div class="two-col">
+      <div class="card ctl-card">
+        <template v-if="s.record.positive && s.record.positive.status==='done'">
+          <div class="ic" :class="s.record.positive.ok ? 'v-pass' : 'v-forged'"><ui-icon :name="s.record.positive.ok ? 'check' : 'x'" :stroke="2.6"></ui-icon></div>
+          <div style="min-width:0"><h4>阳性对照 · {{ s.record.positive.ok ? '通过' : '失败' }}</h4>
+            <p>官方铸造 → 官方回放，应当通过。{{ s.record.positive.ok ? '证明官方 Key 与回放逻辑正常。' : reasonText(s.record.positive.reason) }}</p>
+            <p v-if="!s.record.positive.ok && (s.record.positive.detail?.mint?.error || s.record.positive.detail?.replay?.error)" class="errbox" style="margin-top:8px">{{ s.record.positive.detail?.replay?.error || s.record.positive.detail?.mint?.error }}</p>
+          </div>
+        </template>
+        <template v-else><div class="ic v-running"><span class="spinner"></span></div><div><h4>阳性对照</h4><p>运行中…</p></div></template>
+      </div>
+      <div class="card ctl-card">
+        <template v-if="s.record.negative && s.record.negative.verdict">
+          <div class="ic" :class="s.record.negative.ok ? 'v-pass' : 'v-forged'"><ui-icon :name="s.record.negative.ok ? 'check' : 'x'" :stroke="2.6"></ui-icon></div>
+          <div style="min-width:0"><h4>阴性对照 · {{ s.record.negative.ok ? '通过' : '失败' }}</h4>
+            <p>篡改中转站签名后回放，应被官方拒绝。{{ s.record.negative.ok ? '证明官方确实在校验签名。' : '篡改后的签名没有被拒绝，本次结论不可信。' }}</p>
+            <p v-if="s.record.negative.error" class="errbox neutral" style="margin-top:8px">HTTP {{ s.record.negative.status }} · {{ s.record.negative.error }}</p>
+          </div>
+        </template>
+        <template v-else><div class="ic v-none"><ui-icon name="minus"></ui-icon></div><div><h4>阴性对照 · 未运行</h4><p>中转站没有返回可用的签名块，无需运行。</p></div></template>
+      </div>
+    </div>
+
+    <div class="section-title"><ui-icon name="activity" :size="15"></ui-icon>检测过程</div>
+    <div class="stack">
+      <div v-for="rd in s.record.rounds" :key="rd.id" class="card round">
+        <div class="round-head"><h4>第 {{ rd.idx + 1 }} 轮</h4><verdict-badge :v="rd.verdict"></verdict-badge><span class="small muted">{{ reasonText(rd.reason) }}</span></div>
+        <div class="flow">
+          <div class="flow-step">
+            <div class="h"><span class="n">1</span>中转站铸造
+              <span class="grow"></span>
+              <span class="chip" :class="rd.mint.ok ? 'ok' : 'bad'">{{ rd.mint.ok ? '拿到签名' : '失败' }}</span></div>
+            <dl>
+              <dt>模型</dt><dd class="mono">{{ s.record.relay_model }}</dd>
+              <dt>尝试次数</dt><dd>{{ rd.mint.attempts ?? '—' }}</dd>
+              <dt>耗时</dt><dd>{{ rd.mint.latency_ms ? (rd.mint.latency_ms/1000).toFixed(2) + 's' : '—' }}</dd>
+              <dt>Request ID</dt><dd class="mono">{{ rd.mint.request_id || '—' }}</dd>
+              <template v-if="rd.mint.challenge"><dt>验证编号</dt><dd class="mono">{{ rd.mint.challenge.nonce }}</dd></template>
+            </dl>
+            <div v-if="rd.mint.error" class="errbox"><span v-if="rd.mint.status">HTTP {{ rd.mint.status }} · </span>{{ rd.mint.error }}</div>
+          </div>
+          <div class="arrow"><ui-icon name="arrowRight" :size="18"></ui-icon></div>
+          <div class="flow-step">
+            <div class="h"><span class="n">2</span>官方回放校验
+              <span class="grow"></span>
+              <span v-if="rd.replay.status !== undefined" class="chip" :class="rd.verdict==='pass' ? 'ok' : rd.verdict==='forged' ? 'bad' : 'warn'">HTTP {{ rd.replay.status ?? '—' }}</span>
+              <span v-else class="chip">未执行</span></div>
+            <template v-if="rd.replay.status !== undefined">
+              <dl>
+                <dt>官方模型</dt><dd class="mono">{{ s.record.model }}</dd>
+                <dt>块处理结果</dt><dd>{{ rd.replay.ok ? transText(rd.replay.input_transformations) : '请求被拒绝' }}</dd>
+                <dt>耗时</dt><dd>{{ rd.replay.latency_ms ? (rd.replay.latency_ms/1000).toFixed(2) + 's' : '—' }}</dd>
+                <dt>Request ID</dt><dd class="mono">{{ rd.replay.request_id || '—' }}</dd>
+              </dl>
+              <div v-if="rd.replay.error" class="errbox">{{ rd.replay.error }}</div>
+            </template>
+            <p v-else class="muted small" style="margin:0">铸造阶段没有拿到可校验的签名，跳过回放。</p>
+          </div>
+        </div>
+        <div class="heur" v-if="heurChips(rd.heuristics).length">
+          <span v-for="(c,i) in heurChips(rd.heuristics)" :key="i" class="chip" :class="chipCls(c)">{{ c.t }}</span>
+        </div>
+        <details class="raw">
+          <summary><ui-icon name="chevron" :size="14"></ui-icon>原始数据（中转站响应 / 官方回放结果）</summary>
+          <pre class="json">{{ pretty({ mint: rd.mint, replay: rd.replay, heuristics: rd.heuristics }) }}</pre>
+        </details>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ relays -->
+  <div v-if="s.route.name==='relays'" class="page">
+    <div class="page-head">
+      <div><h1>中转站</h1><p>管理待检测的中转站，Key 只保存在本机</p></div>
+      <button class="btn primary" @click="openRelay()"><ui-icon name="plus"></ui-icon>添加中转站</button>
+    </div>
+    <div class="card">
+      <div class="item-list" v-if="s.relays.length">
+        <div v-for="r in s.relays" :key="r.id" class="item">
+          <div class="avatar" :style="{background: avatarColor(r.name)}">{{ r.name.slice(0,1).toUpperCase() }}</div>
+          <div class="info">
+            <div class="name">{{ r.name }}
+              <span class="chip" v-if="r.stream">默认流式</span>
+              <span class="chip">{{ {auto:'自动认证', 'x-api-key':'x-api-key', bearer:'Bearer'}[r.auth_mode] }}</span>
+            </div>
+            <div class="sub">
+              <span class="mono">{{ r.base_url }}</span>
+              <span class="mono"><ui-icon name="key" :size="12"></ui-icon>{{ r.api_key_masked }}</span>
+              <span v-if="Object.keys(r.model_map).length">模型映射：{{ Object.entries(r.model_map).map(([k,v]) => modelName(k) + ' → ' + v).join('，') }}</span>
+              <span v-if="r.note">{{ r.note }}</span>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn sm" @click="openRelayTest(r)"><ui-icon name="plug" :size="14"></ui-icon>测试连通</button>
+            <button class="btn sm" @click="go('/new?relay=' + r.id)"><ui-icon name="play" :size="14"></ui-icon>检测</button>
+            <button class="btn icon sm ghost" @click="openRelay(r)" title="编辑"><ui-icon name="edit" :size="14"></ui-icon></button>
+            <button class="btn icon sm ghost danger" @click="deleteRelay(r)" title="删除"><ui-icon name="trash" :size="14"></ui-icon></button>
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty">
+        <div class="icon-wrap"><ui-icon name="server" :size="24"></ui-icon></div>
+        <h3>还没有中转站</h3><p>添加第三方中转站的 URL 与 Key，即可检测它提供的 Claude 是否为真。</p>
+        <button class="btn primary" @click="openRelay()"><ui-icon name="plus"></ui-icon>添加中转站</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================================================ keys & settings -->
+  <div v-if="s.route.name==='keys'" class="page">
+    <div class="page-head">
+      <div><h1>官方 Key 与设置</h1><p>官方 Anthropic API Key 用于回放校验和对照实验</p></div>
+      <button class="btn primary" @click="openKey()"><ui-icon name="plus"></ui-icon>添加官方 Key</button>
+    </div>
+    <div class="card">
+      <div class="item-list" v-if="s.keys.length">
+        <div v-for="k in s.keys" :key="k.id" class="item">
+          <div class="avatar" style="background:linear-gradient(140deg,var(--accent),#e29a5c)"><ui-icon name="key" :size="17"></ui-icon></div>
+          <div class="info">
+            <div class="name">{{ k.name }}<span v-if="k.is_default" class="chip accent"><ui-icon name="star" :size="11"></ui-icon>默认</span></div>
+            <div class="sub"><span class="mono">{{ k.api_key_masked }}</span><span v-if="k.note">{{ k.note }}</span></div>
+            <div v-if="s.keyTests[k.id]" class="row wrap" style="gap:6px;margin-top:9px">
+              <span v-if="s.keyTests[k.id].loading" class="chip run"><span class="spinner" style="width:10px;height:10px"></span>测试中</span>
+              <template v-else-if="s.keyTests[k.id].ok">
+                <span class="chip ok"><ui-icon name="check" :size="12" :stroke="3"></ui-icon>Key 有效</span>
+                <span v-for="(ok, mid) in s.keyTests[k.id].available" :key="mid" class="chip" :class="ok ? 'ok' : 'warn'">{{ modelName(mid) }} {{ ok ? '可用' : '不在模型列表' }}</span>
+              </template>
+              <span v-else class="chip bad" style="height:auto;padding:3px 9px;white-space:normal">{{ s.keyTests[k.id].error }}</span>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="btn sm" @click="testKey(k)"><ui-icon name="plug" :size="14"></ui-icon>测试</button>
+            <button class="btn sm" v-if="!k.is_default" @click="setDefaultKey(k)"><ui-icon name="star" :size="14"></ui-icon>设为默认</button>
+            <button class="btn icon sm ghost" @click="openKey(k)" title="编辑"><ui-icon name="edit" :size="14"></ui-icon></button>
+            <button class="btn icon sm ghost danger" @click="deleteKey(k)" title="删除"><ui-icon name="trash" :size="14"></ui-icon></button>
+          </div>
+        </div>
+      </div>
+      <div v-else class="empty">
+        <div class="icon-wrap"><ui-icon name="key" :size="24"></ui-icon></div>
+        <h3>还没有官方 Key</h3><p>需要一个 Anthropic 官方 API Key（sk-ant-…）来校验签名，它只保存在本机。</p>
+        <button class="btn primary" @click="openKey()"><ui-icon name="plus"></ui-icon>添加官方 Key</button>
+      </div>
+    </div>
+
+    <div class="section-title"><ui-icon name="settings" :size="15"></ui-icon>检测设置</div>
+    <div class="card card-pad">
+      <div class="row wrap" style="gap:20px;align-items:flex-end">
+        <div class="field" style="max-width:260px">
+          <label>官方 API 并发上限</label>
+          <input class="input" type="number" min="1" max="20" v-model.number="s.settings.official_concurrency">
+          <span class="hint">所有回放共用一个官方 Key，太高容易触发限流</span>
+        </div>
+        <button class="btn" @click="saveSettings" style="margin-bottom:22px">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  </main>
+</div>
+
+<!-- ============================================================ modals -->
+<div v-if="s.modal" class="overlay" @mousedown.self="s.modal = null">
+
+  <div v-if="s.modal.type==='confirm'" class="modal" style="max-width:440px">
+    <div class="modal-head"><h3>{{ s.modal.title }}</h3></div>
+    <div class="modal-body"><p style="margin:0;color:var(--text-2);white-space:pre-line">{{ s.modal.text }}</p></div>
+    <div class="modal-foot">
+      <button class="btn" @click="s.modal = null">取消</button>
+      <button class="btn" :class="s.modal.danger ? 'danger' : 'primary'" :disabled="s.busy" @click="modalOk">
+        <span v-if="s.busy" class="spinner"></span>{{ s.modal.okText || '确定' }}</button>
+    </div>
+  </div>
+
+  <div v-if="s.modal.type==='relay'" class="modal wide">
+    <div class="modal-head"><h3>{{ s.modal.form.id ? '编辑中转站' : '添加中转站' }}</h3>
+      <button class="btn icon ghost" @click="s.modal = null"><ui-icon name="x"></ui-icon></button></div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <div class="field"><label>名称</label><input class="input" v-model="s.modal.form.name" placeholder="例如：某某中转"></div>
+        <div class="field"><label>Base URL</label><input class="input mono" v-model="s.modal.form.base_url" placeholder="https://api.example.com"></div>
+      </div>
+      <div class="field">
+        <label>API Key</label>
+        <div class="input-group">
+          <input class="input mono" :type="s.modal.showKey ? 'text' : 'password'" v-model="s.modal.form.api_key"
+            :placeholder="s.modal.form.id ? '留空则不修改（当前 ' + s.modal.form.masked + '）' : 'sk-...'" autocomplete="off">
+          <button class="btn ghost icon" @click="s.modal.showKey = !s.modal.showKey" type="button"><ui-icon :name="s.modal.showKey ? 'eyeOff' : 'eye'" :size="15"></ui-icon></button>
+        </div>
+        <span class="hint">填到域名即可，带不带 /v1 或 /v1/messages 都会自动处理</span>
+      </div>
+      <div class="form-grid">
+        <div class="field"><label>认证方式</label>
+          <div class="seg">
+            <button :class="{on: s.modal.form.auth_mode==='auto'}" @click="s.modal.form.auth_mode='auto'">自动</button>
+            <button :class="{on: s.modal.form.auth_mode==='x-api-key'}" @click="s.modal.form.auth_mode='x-api-key'">x-api-key</button>
+            <button :class="{on: s.modal.form.auth_mode==='bearer'}" @click="s.modal.form.auth_mode='bearer'">Bearer</button>
+          </div>
+          <span class="hint">自动 = 两种请求头都带上</span>
+        </div>
+        <div class="field"><label>默认请求方式</label>
+          <label class="row" style="gap:10px;height:38px;cursor:pointer">
+            <span class="switch"><input type="checkbox" v-model="s.modal.form.stream"><span></span></span>
+            <span>{{ s.modal.form.stream ? '流式' : '非流式' }}</span>
+          </label>
+        </div>
+      </div>
+      <div class="field">
+        <label>模型名映射</label>
+        <span class="hint" style="margin-top:-2px">中转站改了模型名时填写；留空表示与官方名称相同</span>
+        <table class="map-table">
+          <tr v-for="m in s.meta.models" :key="m.id">
+            <td>{{ m.id }}</td><td class="arrow">→</td>
+            <td><input class="input mono" style="height:34px" v-model="s.modal.form.model_map[m.id]" :placeholder="m.id"></td>
+          </tr>
+        </table>
+      </div>
+      <div class="field"><label>备注</label><input class="input" v-model="s.modal.form.note" placeholder="可选"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="s.modal = null">取消</button>
+      <button class="btn primary" @click="saveRelay" :disabled="!s.modal.form.name || !s.modal.form.base_url || (!s.modal.form.id && !s.modal.form.api_key)">保存</button>
+    </div>
+  </div>
+
+  <div v-if="s.modal.type==='relayTest'" class="modal">
+    <div class="modal-head"><h3>测试连通 · {{ s.modal.relay.name }}</h3>
+      <button class="btn icon ghost" @click="s.modal = null"><ui-icon name="x"></ui-icon></button></div>
+    <div class="modal-body">
+      <div class="field">
+        <label>发送一条极短消息测试（可选）</label>
+        <select class="select" v-model="s.modal.model">
+          <option value="">只查询模型列表（不消耗额度）</option>
+          <option v-for="m in s.meta.models" :key="m.id" :value="s.modal.relay.model_map[m.id] || m.id">{{ m.name }}（{{ s.modal.relay.model_map[m.id] || m.id }}）</option>
+        </select>
+      </div>
+      <template v-if="s.modal.result">
+        <div class="field">
+          <label>模型列表 /v1/models</label>
+          <div v-if="s.modal.result.models.ok" class="row wrap" style="gap:6px">
+            <span class="chip ok">成功 · {{ s.modal.result.models.ids.length }} 个模型</span>
+            <span v-for="id in s.modal.result.models.ids.slice(0, 30)" :key="id" class="chip mono">{{ id }}</span>
+          </div>
+          <div v-else class="errbox neutral">{{ s.modal.result.models.error }}</div>
+        </div>
+        <div class="field" v-if="s.modal.result.message">
+          <label>消息测试</label>
+          <div v-if="s.modal.result.message.ok" class="row wrap" style="gap:6px">
+            <span class="chip ok">成功</span><span class="chip">回复：{{ s.modal.result.message.text || '（空）' }}</span>
+            <span class="chip mono">{{ s.modal.result.message.model }}</span><span class="chip">{{ (s.modal.result.message.latency_ms/1000).toFixed(1) }}s</span>
+          </div>
+          <div v-else class="errbox">{{ s.modal.result.message.error }}</div>
+        </div>
+      </template>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="s.modal = null">关闭</button>
+      <button class="btn primary" @click="runRelayTest" :disabled="s.modal.loading"><span v-if="s.modal.loading" class="spinner"></span>{{ s.modal.loading ? '测试中' : '开始测试' }}</button>
+    </div>
+  </div>
+
+  <div v-if="s.modal.type==='key'" class="modal">
+    <div class="modal-head"><h3>{{ s.modal.form.id ? '编辑官方 Key' : '添加官方 Key' }}</h3>
+      <button class="btn icon ghost" @click="s.modal = null"><ui-icon name="x"></ui-icon></button></div>
+    <div class="modal-body">
+      <div class="field"><label>名称</label><input class="input" v-model="s.modal.form.name" placeholder="例如：个人账号"></div>
+      <div class="field">
+        <label>API Key</label>
+        <div class="input-group">
+          <input class="input mono" :type="s.modal.showKey ? 'text' : 'password'" v-model="s.modal.form.api_key"
+            :placeholder="s.modal.form.id ? '留空则不修改（当前 ' + s.modal.form.masked + '）' : 'sk-ant-...'" autocomplete="off">
+          <button class="btn ghost icon" @click="s.modal.showKey = !s.modal.showKey" type="button"><ui-icon :name="s.modal.showKey ? 'eyeOff' : 'eye'" :size="15"></ui-icon></button>
+        </div>
+      </div>
+      <label class="row" style="gap:10px;cursor:pointer">
+        <span class="switch"><input type="checkbox" v-model="s.modal.form.is_default"><span></span></span>设为默认
+      </label>
+      <div class="field"><label>备注</label><input class="input" v-model="s.modal.form.note" placeholder="可选"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" @click="s.modal = null">取消</button>
+      <button class="btn primary" @click="saveKey" :disabled="!s.modal.form.name || (!s.modal.form.id && !s.modal.form.api_key)">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts">
+  <div v-for="t in s.toasts" :key="t.id" class="toast" :class="{err: t.err}">
+    <ui-icon :name="t.err ? 'alert' : 'check'" :size="16"></ui-icon>{{ t.text }}
+  </div>
+</div>
+</div>
+
+<script src="/static/vendor/vue.global.prod.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
