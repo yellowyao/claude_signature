@@ -4,6 +4,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response
@@ -29,7 +30,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # 每次访问重新验证页面模板，避免新模板与旧版缓存脚本混用。
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 def mask(key: str) -> str:
@@ -50,16 +52,28 @@ def meta():
 
 @app.get("/api/settings")
 def get_settings():
-    return {"official_concurrency": db.get_setting("official_concurrency", 3)}
+    return {
+        "official_concurrency": db.get_setting("official_concurrency", 3),
+        "system": db.get_setting("system", checker.DEFAULT_SYSTEM),
+    }
+
+
+class SystemBlockIn(BaseModel):
+    type: Literal["text"]
+    text: str = Field(min_length=1)
+    cache_control: dict | None = None
+    citations: list[dict] | None = None
 
 
 class SettingsIn(BaseModel):
     official_concurrency: int = Field(ge=1, le=20)
+    system: list[SystemBlockIn] = Field(min_length=1)
 
 
 @app.put("/api/settings")
 def put_settings(body: SettingsIn):
     db.set_setting("official_concurrency", body.official_concurrency)
+    db.set_setting("system", [block.model_dump(exclude_none=True) for block in body.system])
     return get_settings()
 
 
@@ -233,7 +247,7 @@ def delete_key(kid: int):
 @app.post("/api/keys/{kid}/test")
 async def test_key(kid: int):
     k = _get_key(kid)
-    client = checker.official_client(k["api_key"])
+    client = checker.official_client(k["api_key"], k["id"])
     try:
         page = await client.models.list(limit=100)
         ids = {m.id for m in page.data}
@@ -353,6 +367,11 @@ def _record_detail(rec_id: int) -> dict:
     rec["positive"] = db.one("SELECT * FROM controls WHERE task_id = ? AND model = ?", (rec["task_id"], rec["model"]))
     rec["task"] = db.one("SELECT id, created_at, official_key_name, rounds, stream_mode FROM tasks WHERE id = ?",
                          (rec["task_id"],))
+    rec["official_requests"] = db.query(
+        "SELECT * FROM official_requests WHERE task_id = ? AND model = ? "
+        "AND (record_id = ? OR (record_id IS NULL AND stage IN ('positive_mint', 'positive_replay'))) ORDER BY id",
+        (rec["task_id"], rec["model"], rec_id),
+    )
     return rec
 
 
@@ -393,12 +412,14 @@ def overview():
             " SELECT MAX(id) FROM records WHERE relay_id = ? AND status = 'done' GROUP BY model)", (r["id"],))
         stats = db.one(
             "SELECT COUNT(*) AS total, SUM(verdict = 'pass') AS pass, SUM(verdict = 'forged') AS forged, "
-            "SUM(verdict = 'suspicious') AS suspicious, SUM(verdict IN ('pass','forged','suspicious')) AS decided, "
+            "SUM(verdict = 'suspicious') AS suspicious, SUM(verdict = 'reused') AS reused, "
+            "SUM(verdict IN ('pass','forged','reused','suspicious')) AS decided, "
             "MAX(finished_at) AS last_at, SUM(cost_official) AS cost_official, SUM(cost_relay) AS cost_relay "
             "FROM records WHERE relay_id = ? AND status = 'done'", (r["id"],))
         cards.append({"relay": relay_out(r), "latest": {x["model"]: x for x in latest}, "stats": stats})
     totals = db.one(
         "SELECT COUNT(*) AS records, SUM(verdict = 'forged') AS forged, SUM(verdict = 'suspicious') AS suspicious, "
+        "SUM(verdict = 'reused') AS reused, "
         "SUM(cost_official) AS cost_official, SUM(cost_relay) AS cost_relay FROM records WHERE status = 'done'")
     control_cost = db.one("SELECT SUM(cost_official) AS c FROM controls")["c"] or 0
     totals["cost_official"] = (totals["cost_official"] or 0) + control_cost

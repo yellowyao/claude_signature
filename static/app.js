@@ -46,14 +46,15 @@ const UiIcon = {
 
 /* ------------------------------------------------------------------ verdict vocabulary */
 const VERDICTS = {
-  pass: { label: '通过', icon: 'shieldCheck', desc: '官方成功校验签名，确认是真 Claude 生成' },
-  forged: { label: '掺假', icon: 'shieldX', desc: '官方拒绝了签名，thinking 块是伪造或被篡改的' },
-  suspicious: { label: '可疑', icon: 'alert', desc: '签名真实，但模型被替换，或上下文被中转站改动' },
+  pass: { label: '通过', icon: 'shieldCheck', desc: '官方未拒绝 thinking 签名，正文来源未验证' },
+  forged: { label: '掺假', icon: 'shieldX', desc: '签名伪造、被篡改，或检测到模型替换/降级' },
+  reused: { label: '签名复用', icon: 'refresh', desc: '中转站回答“不是”，按检测规则判为签名复用' },
+  suspicious: { label: '可疑', icon: 'alert', desc: '上下文绑定或 thinking 块处理存在异常' },
   undetectable: { label: '无法检测', icon: 'minus', desc: '没有 thinking / 没有签名 / 非原生格式' },
   invalid: { label: '检测无效', icon: 'ban', desc: '对照实验失败，本次结论不可信' },
   error: { label: '出错', icon: 'zap', desc: '网络、Key 失效、额度不足等请求失败' },
 };
-const STATUS = { queued: '排队中', minting: '中转站铸造', replaying: '官方回放', control: '阴性对照' };
+const STATUS = { queued: '排队中', minting: '中转站铸造', confirming: '中转站相关性追问', replaying: '官方回放' };
 
 const VerdictBadge = {
   props: { v: String, status: String, size: String },
@@ -136,7 +137,8 @@ const app = createApp({
       route: parseRoute(),
       theme: storageGet('theme', 'system'),
       meta: { models: [], reasons: {} },
-      relays: [], keys: [], settings: { official_concurrency: 3 },
+      relays: [], keys: [], settings: { official_concurrency: 3, system: [] },
+      systemJson: '', settingsError: '',
       overview: null, task: null, tasks: [], record: null,
       records: { total: 0, items: [] },
       recTab: 'records',
@@ -177,6 +179,7 @@ const app = createApp({
         api('GET', '/api/meta'), api('GET', '/api/relays'), api('GET', '/api/keys'), api('GET', '/api/settings'),
       ]);
       Object.assign(s, { meta, relays, keys, settings });
+      s.systemJson = JSON.stringify(settings.system || [], null, 2);
       if (!s.newTask.official_key_id) s.newTask.official_key_id = keys.find(k => k.is_default)?.id || keys[0]?.id || null;
     }
     async function loadRoute() {
@@ -221,6 +224,9 @@ const app = createApp({
       if (r.name === 'task' && s.task?.status === 'running') {
         const t = await api('GET', `/api/tasks/${r.id}`).catch(() => null);
         if (t && s.route.name === 'task' && s.route.id === t.id) s.task = t;
+      } else if (r.name === 'record' && s.record && s.record.status !== 'done') {
+        const record = await api('GET', `/api/records/${r.id}`).catch(() => null);
+        if (record && s.route.name === 'record' && s.route.id === record.id) s.record = record;
       } else if (r.name === 'overview' && s.overview?.totals.running && tick % 2 === 0) {
         s.overview = await api('GET', '/api/overview').catch(() => s.overview);
       }
@@ -244,6 +250,7 @@ const app = createApp({
       return [
         { w: (st.pass || 0) / d * 100, c: 'var(--pass)' },
         { w: (st.suspicious || 0) / d * 100, c: 'var(--susp)' },
+        { w: (st.reused || 0) / d * 100, c: 'var(--forged)' },
         { w: (st.forged || 0) / d * 100, c: 'var(--forged)' },
       ];
     }
@@ -257,7 +264,7 @@ const app = createApp({
     const nt = computed(() => {
       const r = s.newTask.relay_ids.length, m = s.newTask.models.length, n = s.newTask.rounds;
       const cells = r * m;
-      return { cells, official: m * 2 + cells * (n + 1), relay: cells * n };
+      return { cells, official: cells * n, relay: cells * n * 2 };
     });
     const canStart = computed(() => nt.value.cells > 0 && s.newTask.official_key_id);
     function confirmStart() {
@@ -265,7 +272,8 @@ const app = createApp({
       s.modal = {
         type: 'confirm', title: '开始检测？', okText: '开始检测',
         text: `将检测 ${s.newTask.relay_ids.length} 个中转站 × ${m} 个模型，共 ${cells} 项。\n` +
-          `官方 API 约 ${nt.value.official} 次请求（含对照实验），中转站约 ${nt.value.relay} 次请求（没有 thinking 时最多重试 3 次）。`,
+          `官方回放最多 ${nt.value.official} 次（仅追问回答“是”后执行），中转站约 ${nt.value.relay} 次请求（含相关性追问）。\n` +
+          '首轮没有 thinking 时最多尝试 3 次，SDK 自动重试另计。',
         onOk: startTask,
       };
     }
@@ -299,7 +307,6 @@ const app = createApp({
       Object.assign(s.newTask, { relay_ids: t.relay_ids.filter(id => alive.has(id)), models: [...t.models], rounds: t.rounds, stream_mode: t.stream_mode });
       go('/new');
     }
-    const controlFor = model => s.task?.controls.find(c => c.model === model);
     const STREAM_MODE = { default: '按中转站设置', stream: '全部流式', nonstream: '全部非流式' };
 
     /* ---------------------------------------------------------------- records */
@@ -347,12 +354,23 @@ const app = createApp({
     }
     const chipCls = c => c.ok === true ? 'ok' : c.warn ? 'warn' : c.ok === false ? 'bad' : '';
     const pretty = o => JSON.stringify(o, null, 2);
+    function prettyBody(body, formatJson = false) {
+      if (body === null || body === undefined) return '未收到完整响应（请求中、连接失败或读取中断）';
+      if (body === '') return '（空）';
+      // 默认展示原文，避免 JSON 解析导致大整数或重复字段的信息丢失。
+      if (!formatJson) return body;
+      try { return pretty(JSON.parse(body)); } catch { return body; }
+    }
+    function officialStage(req) {
+      if (req.stage === 'replay') return `第 ${req.round_idx + 1} 轮 · 官方回放`;
+      return { positive_mint: '阳性对照 · 官方铸造', positive_replay: '阳性对照 · 官方回放', negative_replay: '阴性对照 · 官方回放' }[req.stage] || '官方请求';
+    }
     function transText(t) {
       if (t === undefined || t === null) return '—';
       if (!t.length) return '[]（未丢弃任何块）';
       return t.map(x => `${x.reason}（${x.type} @ ${x.path}）`).join('；');
     }
-    const heroColor = v => ({ pass: 'var(--pass)', forged: 'var(--forged)', suspicious: 'var(--susp)', undetectable: 'var(--undet)', invalid: 'var(--invalid)', error: 'var(--error)' }[v] || 'var(--border)');
+    const heroColor = v => ({ pass: 'var(--pass)', forged: 'var(--forged)', reused: 'var(--forged)', suspicious: 'var(--susp)', undetectable: 'var(--undet)', invalid: 'var(--invalid)', error: 'var(--error)' }[v] || 'var(--border)');
 
     /* ---------------------------------------------------------------- relays */
     function openRelay(r) {
@@ -424,8 +442,28 @@ const app = createApp({
       try { s.keyTests[k.id] = await api('POST', `/api/keys/${k.id}/test`); }
       catch (e) { s.keyTests[k.id] = { ok: false, error: e.message }; }
     }
+    function validateSystemJson() {
+      try {
+        const value = JSON.parse(s.systemJson);
+        if (!Array.isArray(value)) throw new Error('顶层必须是数组');
+        s.settingsError = '';
+        return value;
+      } catch (e) {
+        s.settingsError = `System 配置无效：${e.message}`;
+        return null;
+      }
+    }
     async function saveSettings() {
-      await guard(async () => { s.settings = await api('PUT', '/api/settings', s.settings); toast('设置已保存'); });
+      const system = validateSystemJson();
+      if (!system) return;
+      try {
+        s.settings = await api('PUT', '/api/settings', { ...s.settings, system });
+        s.systemJson = JSON.stringify(s.settings.system, null, 2);
+        s.settingsError = '';
+        toast('设置已保存');
+      } catch (e) {
+        s.settingsError = e.message;
+      }
     }
 
     async function modalOk() {
@@ -440,11 +478,11 @@ const app = createApp({
       fmtTime, relTime, money, host, avatarColor, modelName, reasonText, go,
       hasKey, meterParts, passRate,
       toggle, nt, canStart, confirmStart,
-      taskView, controlFor, rerun,
+      taskView, rerun,
       deleteRecord, deleteTask, pageInfo, page,
-      heurChips, chipCls, pretty, transText, heroColor,
+      heurChips, chipCls, pretty, prettyBody, officialStage, transText, heroColor,
       openRelay, saveRelay, deleteRelay, openRelayTest, runRelayTest,
-      openKey, saveKey, setDefaultKey, deleteKey, testKey, saveSettings,
+      openKey, saveKey, setDefaultKey, deleteKey, testKey, validateSystemJson, saveSettings,
       modalOk,
     };
   },

@@ -31,6 +31,22 @@ CREATE TABLE IF NOT EXISTS official_keys (
     note TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS official_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at REAL NOT NULL,
+    official_key_id INTEGER NOT NULL,
+    task_id INTEGER,
+    method TEXT NOT NULL,
+    url TEXT NOT NULL,
+    request_body TEXT NOT NULL,
+    record_id INTEGER,
+    model TEXT,
+    stage TEXT,
+    round_idx INTEGER,
+    status_code INTEGER,
+    response_request_id TEXT,
+    response_body TEXT
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -84,6 +100,7 @@ CREATE TABLE IF NOT EXISTS rounds (
     verdict TEXT NOT NULL,
     reason TEXT NOT NULL DEFAULT '',
     mint TEXT NOT NULL DEFAULT '{}',
+    relevance TEXT NOT NULL DEFAULT '{}',
     replay TEXT NOT NULL DEFAULT '{}',
     heuristics TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
@@ -94,7 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_rounds_record ON rounds(record_id);
 CREATE INDEX IF NOT EXISTS idx_controls_task ON controls(task_id);
 """
 
-JSON_FIELDS = {"model_map", "models", "relay_ids", "detail", "negative", "mint", "replay", "heuristics"}
+JSON_FIELDS = {"model_map", "models", "relay_ids", "detail", "negative", "mint", "relevance", "replay", "heuristics"}
 
 _lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -108,6 +125,17 @@ def init() -> None:
     _conn.execute("PRAGMA foreign_keys = ON")
     _conn.execute("PRAGMA journal_mode = WAL")
     _conn.executescript(SCHEMA)
+    # 旧记录保留原结果，新增的追问数据默认为空。
+    round_columns = {row["name"] for row in _conn.execute("PRAGMA table_info(rounds)")}
+    if "relevance" not in round_columns:
+        _conn.execute("ALTER TABLE rounds ADD COLUMN relevance TEXT NOT NULL DEFAULT '{}'")
+    # 兼容已保存请求体的旧数据库，原有请求日志保持不变。
+    columns = {row["name"] for row in _conn.execute("PRAGMA table_info(official_requests)")}
+    for name, kind in {"record_id": "INTEGER", "model": "TEXT", "stage": "TEXT", "round_idx": "INTEGER",
+                       "status_code": "INTEGER", "response_request_id": "TEXT", "response_body": "TEXT"}.items():
+        if name not in columns:
+            _conn.execute(f"ALTER TABLE official_requests ADD COLUMN {name} {kind}")
+    _conn.execute("CREATE INDEX IF NOT EXISTS idx_official_requests_task_model ON official_requests(task_id, model)")
     _conn.commit()
 
 

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Claude 签名检测</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23c9643f' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z'/%3E%3Cpath d='m9 12 2 2 4-4'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20261105-reuse-1">
 <script>
   // apply the saved theme before first paint
   try { const t = localStorage.getItem('theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
@@ -68,6 +68,7 @@
         <div class="card stat"><div class="label"><ui-icon name="server" :size="14"></ui-icon>中转站</div><div class="value">{{ s.overview.totals.relays }}</div></div>
         <div class="card stat"><div class="label"><ui-icon name="activity" :size="14"></ui-icon>检测次数</div><div class="value">{{ s.overview.totals.records || 0 }}<small>项</small></div></div>
         <div class="card stat" :class="{alert: s.overview.totals.forged}"><div class="label"><ui-icon name="shieldX" :size="14"></ui-icon>发现掺假</div><div class="value">{{ s.overview.totals.forged || 0 }}</div></div>
+        <div class="card stat" :class="{alert: s.overview.totals.reused}"><div class="label"><ui-icon name="refresh" :size="14"></ui-icon>签名复用</div><div class="value">{{ s.overview.totals.reused || 0 }}</div></div>
         <div class="card stat" :class="{warn: s.overview.totals.suspicious}"><div class="label"><ui-icon name="alert" :size="14"></ui-icon>可疑</div><div class="value">{{ s.overview.totals.suspicious || 0 }}</div></div>
         <div class="card stat tip" :data-tip="'中转站侧按官方价折算 ' + money(s.overview.totals.cost_relay)"><div class="label"><ui-icon name="dollar" :size="14"></ui-icon>官方花费</div><div class="value">{{ money(s.overview.totals.cost_official) }}</div></div>
       </div>
@@ -111,7 +112,7 @@
       <h3>三步开始检测</h3>
       <p>先存一个官方 API Key 用来校验签名，再添加要检测的中转站，然后发起检测。</p>
       <div class="steps" style="max-width:760px;margin:0 auto">
-        <a href="#/keys" class="step" :class="{done: hasKey}"><span class="n">{{ hasKey ? '✓' : 1 }}</span><b>添加官方 Key</b><span>用于回放校验与对照实验，只保存在本机</span></a>
+        <a href="#/keys" class="step" :class="{done: hasKey}"><span class="n">{{ hasKey ? '✓' : 1 }}</span><b>添加官方 Key</b><span>用于回放校验，只保存在本机</span></a>
         <a href="#/relays" class="step" :class="{done: s.overview.cards.length}"><span class="n">{{ s.overview.cards.length ? '✓' : 2 }}</span><b>添加中转站</b><span>填写 URL 与 Key，可配置模型名映射</span></a>
         <a href="#/new" class="step"><span class="n">3</span><b>发起检测</b><span>多选中转站和模型，实时查看结果</span></a>
       </div>
@@ -126,7 +127,7 @@
   <!-- ============================================================ new task -->
   <div v-if="s.route.name==='new'" class="page">
     <div class="page-head">
-      <div><h1>发起检测</h1><p>每项检测：中转站铸造带签名的 thinking 块 → 官方回放校验，并自动运行阳性与阴性对照</p></div>
+      <div><h1>发起检测</h1><p>每轮检测：中转站生成 thinking → 追问是否与题目有关 → 回答“是”后官方回放校验</p></div>
     </div>
 
     <div v-if="!s.relays.length || !s.keys.length" class="banner warn">
@@ -214,13 +215,11 @@
         <div class="row" style="align-items:baseline;gap:6px;margin:6px 0 4px"><span class="big">{{ nt.cells }}</span><span class="muted">项</span></div>
         <div class="muted small">{{ s.newTask.relay_ids.length }} 个中转站 × {{ s.newTask.models.length }} 个模型 × {{ s.newTask.rounds }} 轮</div>
         <div class="divider"></div>
-        <div class="line"><span class="muted">官方 API 请求</span><b>≈ {{ nt.cells ? nt.official : 0 }}</b></div>
+        <div class="line"><span class="muted">官方回放（不含重试）</span><b>≤ {{ nt.official }}</b></div>
         <div class="line"><span class="muted">中转站请求</span><b>≈ {{ nt.relay }}</b></div>
-        <div class="line"><span class="muted">阳性对照</span><span>每个模型 1 次</span></div>
-        <div class="line"><span class="muted">阴性对照</span><span>每项 1 次</span></div>
         <div class="divider"></div>
         <button class="btn primary lg" style="width:100%" :disabled="!canStart" @click="confirmStart"><ui-icon name="play"></ui-icon>开始检测</button>
-        <p class="muted small" style="margin:12px 0 0">花费按官方返回的实际 usage 统计，可在记录中查看。</p>
+        <p class="muted small" style="margin:12px 0 0">追问未确认“是”时跳过官方回放。自动重试另计，花费按实际 usage 统计。</p>
       </div>
     </div>
   </div>
@@ -256,21 +255,6 @@
         <div><span class="k">请求方式</span><span class="v">{{ STREAM_MODE[s.task.stream_mode] }}</span></div>
         <div><span class="k">官方花费</span><span class="v">{{ money(taskView.cost) }}</span></div>
         <div><span class="k">中转站花费（官方价折算）</span><span class="v">{{ money(taskView.costRelay) }}</span></div>
-      </div>
-    </div>
-
-    <div class="section-title"><ui-icon name="flask" :size="15"></ui-icon>阳性对照（官方铸造 → 官方回放）</div>
-    <div class="control-strip">
-      <div v-for="m in s.task.models" :key="m" class="control">
-        <template v-if="!controlFor(m) || controlFor(m).status !== 'done'">
-          <div class="ic v-running"><span class="spinner"></span></div>
-          <div><div class="t">{{ modelName(m) }}</div><div class="d">运行中…</div></div>
-        </template>
-        <template v-else>
-          <div class="ic" :class="controlFor(m).ok ? 'v-pass' : 'v-forged'"><ui-icon :name="controlFor(m).ok ? 'check' : 'x'" :size="15" :stroke="2.6"></ui-icon></div>
-          <div style="min-width:0"><div class="t">{{ modelName(m) }} · {{ controlFor(m).ok ? '通过' : '失败' }}</div>
-            <div class="d">{{ controlFor(m).ok ? '官方 Key 与回放逻辑正常' : reasonText(controlFor(m).reason) }}</div></div>
-        </template>
       </div>
     </div>
 
@@ -412,30 +396,6 @@
       <div><div class="k">任务</div><div class="v"><a :href="'#/tasks/' + s.record.task_id" style="color:var(--accent)">#{{ s.record.task_id }}</a></div></div>
     </div>
 
-    <div class="section-title"><ui-icon name="flask" :size="15"></ui-icon>对照实验</div>
-    <div class="two-col">
-      <div class="card ctl-card">
-        <template v-if="s.record.positive && s.record.positive.status==='done'">
-          <div class="ic" :class="s.record.positive.ok ? 'v-pass' : 'v-forged'"><ui-icon :name="s.record.positive.ok ? 'check' : 'x'" :stroke="2.6"></ui-icon></div>
-          <div style="min-width:0"><h4>阳性对照 · {{ s.record.positive.ok ? '通过' : '失败' }}</h4>
-            <p>官方铸造 → 官方回放，应当通过。{{ s.record.positive.ok ? '证明官方 Key 与回放逻辑正常。' : reasonText(s.record.positive.reason) }}</p>
-            <p v-if="!s.record.positive.ok && (s.record.positive.detail?.mint?.error || s.record.positive.detail?.replay?.error)" class="errbox" style="margin-top:8px">{{ s.record.positive.detail?.replay?.error || s.record.positive.detail?.mint?.error }}</p>
-          </div>
-        </template>
-        <template v-else><div class="ic v-running"><span class="spinner"></span></div><div><h4>阳性对照</h4><p>运行中…</p></div></template>
-      </div>
-      <div class="card ctl-card">
-        <template v-if="s.record.negative && s.record.negative.verdict">
-          <div class="ic" :class="s.record.negative.ok ? 'v-pass' : 'v-forged'"><ui-icon :name="s.record.negative.ok ? 'check' : 'x'" :stroke="2.6"></ui-icon></div>
-          <div style="min-width:0"><h4>阴性对照 · {{ s.record.negative.ok ? '通过' : '失败' }}</h4>
-            <p>篡改中转站签名后回放，应被官方拒绝。{{ s.record.negative.ok ? '证明官方确实在校验签名。' : '篡改后的签名没有被拒绝，本次结论不可信。' }}</p>
-            <p v-if="s.record.negative.error" class="errbox neutral" style="margin-top:8px">HTTP {{ s.record.negative.status }} · {{ s.record.negative.error }}</p>
-          </div>
-        </template>
-        <template v-else><div class="ic v-none"><ui-icon name="minus"></ui-icon></div><div><h4>阴性对照 · 未运行</h4><p>中转站没有返回可用的签名块，无需运行。</p></div></template>
-      </div>
-    </div>
-
     <div class="section-title"><ui-icon name="activity" :size="15"></ui-icon>检测过程</div>
     <div class="stack">
       <div v-for="rd in s.record.rounds" :key="rd.id" class="card round">
@@ -456,7 +416,24 @@
           </div>
           <div class="arrow"><ui-icon name="arrowRight" :size="18"></ui-icon></div>
           <div class="flow-step">
-            <div class="h"><span class="n">2</span>官方回放校验
+            <div class="h"><span class="n">2</span>中转站相关性追问
+              <span class="grow"></span>
+              <span v-if="rd.relevance?.question" class="chip" :class="rd.relevance.ok ? 'ok' : 'bad'">{{ rd.relevance.ok ? '是' : rd.relevance.related === false ? '签名复用' : '未确认' }}</span>
+              <span v-else class="chip">未执行</span></div>
+            <template v-if="rd.relevance?.question">
+              <dl>
+                <dt>追问</dt><dd>{{ rd.relevance.question }}</dd>
+                <dt>回答原文</dt><dd>{{ rd.relevance.answer || '（空）' }}</dd>
+                <dt>耗时</dt><dd>{{ rd.relevance.latency_ms ? (rd.relevance.latency_ms/1000).toFixed(2) + 's' : '—' }}</dd>
+                <dt>Request ID</dt><dd class="mono">{{ rd.relevance.request_id || '—' }}</dd>
+              </dl>
+              <div v-if="rd.relevance.error" class="errbox"><span v-if="rd.relevance.status">HTTP {{ rd.relevance.status }} · </span>{{ rd.relevance.error }}</div>
+            </template>
+            <p v-else class="muted small" style="margin:0">该轮没有相关性追问记录。</p>
+          </div>
+          <div class="arrow"><ui-icon name="arrowRight" :size="18"></ui-icon></div>
+          <div class="flow-step">
+            <div class="h"><span class="n">3</span>官方回放校验
               <span class="grow"></span>
               <span v-if="rd.replay.status !== undefined" class="chip" :class="rd.verdict==='pass' ? 'ok' : rd.verdict==='forged' ? 'bad' : 'warn'">HTTP {{ rd.replay.status ?? '—' }}</span>
               <span v-else class="chip">未执行</span></div>
@@ -469,17 +446,40 @@
               </dl>
               <div v-if="rd.replay.error" class="errbox">{{ rd.replay.error }}</div>
             </template>
-            <p v-else class="muted small" style="margin:0">铸造阶段没有拿到可校验的签名，跳过回放。</p>
+            <p v-else class="muted small" style="margin:0">{{ rd.relevance?.question ? '相关性追问未确认“是”，跳过官方回放。' : '该轮未进行官方回放。' }}</p>
           </div>
         </div>
         <div class="heur" v-if="heurChips(rd.heuristics).length">
           <span v-for="(c,i) in heurChips(rd.heuristics)" :key="i" class="chip" :class="chipCls(c)">{{ c.t }}</span>
         </div>
         <details class="raw">
-          <summary><ui-icon name="chevron" :size="14"></ui-icon>原始数据（中转站响应 / 官方回放结果）</summary>
-          <pre class="json">{{ pretty({ mint: rd.mint, replay: rd.replay, heuristics: rd.heuristics }) }}</pre>
+          <summary><ui-icon name="chevron" :size="14"></ui-icon>原始数据（中转站首轮 / 相关性追问 / 官方回放）</summary>
+          <pre class="json">{{ pretty({ mint: rd.mint, relevance: rd.relevance, replay: rd.replay, heuristics: rd.heuristics }) }}</pre>
         </details>
       </div>
+    </div>
+
+    <div class="card upstream-logs">
+      <div class="card-head">
+        <div><h3>官方上游请求与响应</h3><div class="sub">记录每轮官方回放，每次重试单独列出；完整内容也会随 JSON 导出。</div></div>
+      </div>
+      <template v-if="s.record.official_requests?.length">
+        <details v-for="req in s.record.official_requests" :key="req.id" class="raw upstream-request">
+          <summary>
+            <ui-icon name="chevron" :size="14" aria-hidden="true"></ui-icon>
+            <span>{{ officialStage(req) }}</span>
+            <span class="chip" :class="req.status_code == null ? 'warn' : req.status_code < 400 ? 'ok' : 'bad'">{{ req.status_code == null ? '未收到响应' : 'HTTP ' + req.status_code }}</span>
+            <span class="muted small">#{{ req.id }} · {{ fmtTime(req.created_at) }}</span>
+          </summary>
+          <div class="upstream-meta mono">{{ req.method }} {{ req.url }}<br>Request ID：{{ req.response_request_id || '—' }}</div>
+          <label class="upstream-format"><input type="checkbox" v-model="req.formatJson">格式化 JSON（取消勾选查看原文）</label>
+          <h4 class="upstream-label">完整请求体</h4>
+          <pre class="json" tabindex="0" aria-label="官方上游完整请求体">{{ prettyBody(req.request_body, req.formatJson) }}</pre>
+          <h4 class="upstream-label">完整响应内容</h4>
+          <pre class="json" tabindex="0" aria-label="官方上游完整响应内容">{{ prettyBody(req.response_body, req.formatJson) }}</pre>
+        </details>
+      </template>
+      <p v-else class="upstream-empty muted">暂无可展示的官方上游请求与响应。更新并重启服务后，新检测会自动记录；历史缺失的完整响应无法补录。</p>
     </div>
   </div>
 
@@ -524,7 +524,7 @@
   <!-- ============================================================ keys & settings -->
   <div v-if="s.route.name==='keys'" class="page">
     <div class="page-head">
-      <div><h1>官方 Key 与设置</h1><p>官方 Anthropic API Key 用于回放校验和对照实验</p></div>
+      <div><h1>官方 Key 与设置</h1><p>官方 Anthropic API Key 用于回放校验</p></div>
       <button class="btn primary" @click="openKey()"><ui-icon name="plus"></ui-icon>添加官方 Key</button>
     </div>
     <div class="card">
@@ -560,13 +560,23 @@
 
     <div class="section-title"><ui-icon name="settings" :size="15"></ui-icon>检测设置</div>
     <div class="card card-pad">
-      <div class="row wrap" style="gap:20px;align-items:flex-end">
+      <div class="stack">
         <div class="field" style="max-width:260px">
           <label>官方 API 并发上限</label>
           <input class="input" type="number" min="1" max="20" v-model.number="s.settings.official_concurrency">
           <span class="hint">所有回放共用一个官方 Key，太高容易触发限流</span>
         </div>
-        <button class="btn" @click="saveSettings" style="margin-bottom:22px">保存设置</button>
+        <div class="field">
+          <label for="system-json">System 文本块数组</label>
+          <textarea id="system-json" class="input system-editor" rows="10" spellcheck="false"
+                    v-model="s.systemJson" @blur="validateSystemJson"
+                    :aria-invalid="!!s.settingsError" aria-describedby="system-json-hint system-json-error"></textarea>
+          <span id="system-json-hint" class="hint">使用 Anthropic Messages API 的 text block 数组；每项需要 type 和 text。</span>
+          <span v-if="s.settingsError" id="system-json-error" class="field-error" role="alert">{{ s.settingsError }}</span>
+        </div>
+        <div class="actions" style="justify-content:flex-end">
+          <button class="btn primary" @click="saveSettings">保存设置</button>
+        </div>
       </div>
     </div>
   </div>
@@ -707,6 +717,6 @@
 </div>
 
 <script src="/static/vendor/vue.global.prod.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20261105-model-mismatch-1"></script>
 </body>
 </html>

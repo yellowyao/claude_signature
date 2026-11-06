@@ -1,4 +1,4 @@
-"""Signature check primitives: mint a thinking block, replay it to the official API, classify.
+"""Mint a thinking block, ask the relay about relevance, then replay it to the official API.
 
 Mint: ask the model a small reasoning puzzle with one tool available, so the reply is
 `thinking + tool_use`. Replay: send [user, assistant(as returned), user(tool_result)] to the
@@ -10,20 +10,31 @@ import base64
 import random
 import secrets
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import anthropic
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
+
+from . import db
 
 OFFICIAL_BASE_URL = "https://api.anthropic.com"
 BINDING_BETA = "thinking-binding-controls-2026-08-01"
 MINT_MAX_TOKENS = 8000
+RELEVANCE_MAX_TOKENS = 1024
 REPLAY_MAX_TOKENS = 1024
 MINT_ATTEMPTS = 3
+RELEVANCE_QUESTION = "刚才的思考是否与题目有关？只回答“是”或“不是”，不要解释，也不要调用工具。"
 
-SYSTEM_PROMPT = (
-    "You are a precise calculator. Work the problem out carefully, "
-    "then report the final result by calling the submit_answer tool."
-)
+DEFAULT_SYSTEM = [
+    {
+        "type": "text",
+        "text": (
+            "You are a precise calculator. Work the problem out carefully, "
+            "then report the final result by calling the submit_answer tool."
+        ),
+    }
+]
 
 TOOLS = [
     {
@@ -66,8 +77,42 @@ def relay_client(relay: dict) -> AsyncAnthropic:
     return AsyncAnthropic(api_key=key, default_headers={"Authorization": f"Bearer {key}"}, **common)
 
 
-def official_client(api_key: str) -> AsyncAnthropic:
-    return AsyncAnthropic(api_key=api_key, base_url=OFFICIAL_BASE_URL, timeout=300.0, max_retries=2)
+_official_request_context: ContextVar[dict] = ContextVar("official_request_context", default={})
+
+
+@contextmanager
+def official_request_context(stage: str, model: str, record_id: int | None = None, round_idx: int | None = None):
+    # 官方客户端由并发检测共享，使用协程上下文防止日志串到其他记录。
+    token = _official_request_context.set({"stage": stage, "model": model, "record_id": record_id, "round_idx": round_idx})
+    try:
+        yield
+    finally:
+        _official_request_context.reset(token)
+
+
+def official_client(api_key: str, official_key_id: int, task_id: int | None = None) -> AsyncAnthropic:
+    async def save_request(request) -> None:
+        # 在发送前保存 SDK 序列化后的完整请求体，失败和自动重试也会逐次记录。
+        body = await request.aread()
+        request.extensions["official_request_id"] = db.insert("official_requests", {
+            "created_at": db.now(), "official_key_id": official_key_id, "task_id": task_id,
+            "method": request.method, "url": str(request.url), "request_body": body.decode("utf-8"),
+            **_official_request_context.get(),
+        })
+
+    async def save_response(response) -> None:
+        row_id = response.request.extensions["official_request_id"]
+        db.update("official_requests", row_id, {
+            "status_code": response.status_code, "response_request_id": response.headers.get("request-id"),
+        })
+        # 在 SDK 解析或因错误状态重试前读取，保留非 JSON 错误页等完整响应。
+        await response.aread()
+        db.update("official_requests", row_id, {"response_body": response.text})
+
+    return AsyncAnthropic(
+        api_key=api_key, base_url=OFFICIAL_BASE_URL, timeout=300.0, max_retries=2,
+        http_client=DefaultAsyncHttpxClient(event_hooks={"request": [save_request], "response": [save_response]}),
+    )
 
 
 # ---------------------------------------------------------------- challenge
@@ -113,7 +158,7 @@ def _request_id_of(e: Exception) -> str | None:
     return None
 
 
-async def _call_mint(client: AsyncAnthropic, params: dict, stream: bool) -> tuple[dict, str | None]:
+async def _call_relay(client: AsyncAnthropic, params: dict, stream: bool) -> tuple[dict, str | None]:
     if stream:
         async with client.messages.stream(**params) as s:
             msg = await s.get_final_message()
@@ -143,7 +188,7 @@ def _format_problem(data) -> str | None:
     return None
 
 
-async def mint(client: AsyncAnthropic, model: str, stream: bool) -> dict:
+async def mint(client: AsyncAnthropic, model: str, stream: bool, system: list[dict]) -> dict:
     """Mint a signed thinking block. Retries a few times when the model answers without thinking."""
     result: dict = {"attempts": 0, "usages": []}
     use_effort = True
@@ -152,7 +197,7 @@ async def mint(client: AsyncAnthropic, model: str, stream: bool) -> dict:
         params = dict(
             model=model,
             max_tokens=MINT_MAX_TOKENS,
-            system=SYSTEM_PROMPT,
+            system=system,
             tools=TOOLS,
             tool_choice={"type": "auto"},
             thinking={"type": "adaptive"},
@@ -163,7 +208,7 @@ async def mint(client: AsyncAnthropic, model: str, stream: bool) -> dict:
         result["attempts"] += 1
         started = time.perf_counter()
         try:
-            data, request_id = await _call_mint(client, params, stream)
+            data, request_id = await _call_relay(client, params, stream)
         except FormatError as e:
             return {**result, "ok": False, "kind": "unsupported_format", "error": str(e)}
         except Exception as e:  # noqa: BLE001 - every relay failure is reported, never raised
@@ -234,20 +279,66 @@ def thinking_paths(assistant: list[dict]) -> list[str]:
     return [f"messages.1.content.{i}" for i, b in enumerate(assistant) if b["type"] in THINKING_TYPES]
 
 
-def replay_messages(challenge: dict, assistant: list[dict]) -> list[dict]:
+def replay_messages(challenge: dict, assistant: list[dict], question: str | None = None) -> list[dict]:
     tool_ids = [b["id"] for b in assistant if b["type"] == "tool_use"]
     if tool_ids:
         follow = [{"type": "tool_result", "tool_use_id": tid, "content": "已收到。"} for tid in tool_ids]
+        if question:
+            # 工具结果必须放在前面，随后才能追加本轮追问。
+            follow.append({"type": "text", "text": question})
     else:
-        follow = "已收到，请用一句话确认结果。"
+        follow = question or "已收到，请用一句话确认结果。"
     return [*first_messages(challenge), {"role": "assistant", "content": assistant}, {"role": "user", "content": follow}]
 
 
-async def replay(client: AsyncAnthropic, model: str, challenge: dict, assistant: list[dict]) -> dict:
+async def check_relevance(client: AsyncAnthropic, model: str, mint_result: dict, assistant: list[dict], stream: bool, system: list[dict]) -> dict:
+    params = dict(
+        model=model,
+        max_tokens=RELEVANCE_MAX_TOKENS,
+        system=system,
+        tools=TOOLS,
+        tool_choice={"type": "none"},
+        thinking={"type": "adaptive"},
+        messages=replay_messages(mint_result["challenge"], assistant, RELEVANCE_QUESTION),
+    )
+    if "output_config" in mint_result["params"]:
+        params["output_config"] = {"effort": "low"}
+    result = {"question": RELEVANCE_QUESTION,
+              "params": {k: v for k, v in params.items() if k not in ("system", "tools", "messages")}}
+    started = time.perf_counter()
+    try:
+        data, request_id = await _call_relay(client, params, stream)
+    except Exception as e:  # noqa: BLE001
+        return {**result, "ok": False, "kind": "unsupported_format" if isinstance(e, FormatError) else "relay_error",
+                "status": _status_of(e), "error": _error_text(e), "request_id": _request_id_of(e),
+                "latency_ms": int((time.perf_counter() - started) * 1000)}
+
+    result.update(response=data, request_id=request_id, status=200,
+                  latency_ms=int((time.perf_counter() - started) * 1000))
+    if isinstance(data, dict) and data.get("type") == "error":
+        err = data.get("error") or {}
+        return {**result, "ok": False, "kind": "relay_error", "error": str(err.get("message") or err)}
+    problem = _format_problem(data)
+    if problem:
+        return {**result, "ok": False, "kind": "unsupported_format", "error": problem}
+
+    result["usage"] = data.get("usage") or {}
+    text_blocks = [b for b in data["content"] if isinstance(b, dict) and b.get("type") == "text"]
+    if any(not isinstance(b.get("text"), str) for b in text_blocks):
+        return {**result, "ok": False, "kind": "unsupported_format", "error": "相关性追问的 text 块缺少有效文本"}
+    answer = "".join(b["text"] for b in text_blocks).strip()
+    normalized = answer.strip(" \t\r\n。.!！\"'“”‘’")
+    # 必须完整回答指定选项，不能把“不是”或截断的“是”误判为确认。
+    related = normalized == "是" if normalized in ("是", "不是") and data.get("stop_reason") == "end_turn" else None
+    kind = "relevance_confirmed" if related is True else "thinking_unrelated" if related is False else "relevance_unconfirmed"
+    return {**result, "ok": related is True, "kind": kind, "related": related, "answer": answer}
+
+
+async def replay(client: AsyncAnthropic, model: str, challenge: dict, assistant: list[dict], system: list[dict]) -> dict:
     params = dict(
         model=model,
         max_tokens=REPLAY_MAX_TOKENS,
-        system=SYSTEM_PROMPT,
+        system=system,
         tools=TOOLS,
         tool_choice={"type": "auto"},
         thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}},
@@ -284,7 +375,7 @@ REASONS = {
     "org_binding": "签名真实（官方可解密），来自其他账号；该模型有账号绑定，属正常",
     "no_diagnostics": "官方未拒绝签名，但响应里没有诊断字段，无法进一步核对模型与上下文",
     "forged": "官方拒绝了签名：签名是伪造或被篡改的",
-    "model_mismatch": "签名真实，但不是声称的模型生成的，疑似模型替换/降级",
+    "model_mismatch": "签名真实，但不是声称的模型生成的，判为掺假（模型替换/降级）",
     "prefix_mismatch": "签名真实，但中转站改动了上下文（如注入 system prompt，常见于订阅号反代）",
     "unknown_transformation": "官方丢弃了该 thinking 块，原因未知",
     "replay_error": "官方回放请求报错（非签名问题）",
@@ -293,6 +384,8 @@ REASONS = {
     "unsupported_format": "中转站不支持 Anthropic 原生 /v1/messages 格式",
     "no_thinking": "中转站没有返回 thinking 块",
     "no_signature": "thinking 块没有 signature",
+    "thinking_unrelated": "中转站回答“不是”，按检测规则判为签名复用，已跳过官方回放",
+    "relevance_unconfirmed": "中转站未完整、明确地回答“是”或“不是”，已跳过官方回放",
 }
 
 
@@ -314,7 +407,7 @@ def classify_replay(rep: dict, paths: list[str]) -> tuple[str, str]:
     ours = [t for t in trans if t.get("path") in paths] or trans
     reasons = {t.get("reason") for t in ours}
     if "model_binding_mismatch" in reasons:
-        return "suspicious", "model_mismatch"
+        return "forged", "model_mismatch"
     if "prefix_binding_mismatch" in reasons:
         return "suspicious", "prefix_mismatch"
     if reasons - {"organization_binding_mismatch"}:
@@ -325,24 +418,6 @@ def classify_replay(rep: dict, paths: list[str]) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------- helpers
-
-
-_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-
-
-def tamper(assistant: list[dict]) -> list[dict]:
-    """Copy of the assistant turn with a few characters of the first signature changed."""
-    out = [dict(b) for b in assistant]
-    for b in out:
-        field = "signature" if b["type"] == "thinking" else "data" if b["type"] == "redacted_thinking" else None
-        if field and b.get(field):
-            s = list(b[field])
-            for pos in (len(s) // 4, len(s) // 2, (len(s) * 3) // 4):
-                c = s[pos]
-                s[pos] = _B64[(_B64.index(c) + 7) % 64] if c in _B64 else "A"
-            b[field] = "".join(s)
-            break
-    return out
 
 
 def _is_b64(s: str) -> bool:
