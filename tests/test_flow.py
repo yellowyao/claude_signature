@@ -42,11 +42,11 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         })
         return task_id, record_id
 
-    async def run_flow(self, reply, stream: bool = False, stop_reason: str = "end_turn", rounds: int = 1):
+    async def run_flow(self, reply, stream: bool = False, stop_reason: str = "end_turn", rounds: int = 1, replay_result: dict | None = None):
         task_id, record_id = self.create_task(stream, rounds)
-        confirmation = reply if isinstance(reply, Exception) else (message([{"type": "text", "text": reply}], stop_reason), "req_followup")
+        confirmation = reply if isinstance(reply, Exception) else (reply if isinstance(reply, dict) else message([{"type": "text", "text": reply}], stop_reason), "req_followup")
         call_relay = AsyncMock(side_effect=[(message(ASSISTANT, "tool_use"), "req_mint"), confirmation] * rounds)
-        replay = AsyncMock(return_value={"ok": True, "status": 200, "input_transformations": [], "usage": USAGE})
+        replay = AsyncMock(return_value=replay_result if replay_result is not None else {"ok": True, "status": 200, "input_transformations": [], "usage": USAGE})
         official = SimpleNamespace(close=AsyncMock())
         relay = SimpleNamespace(close=AsyncMock())
         with patch.object(checker, "official_client", return_value=official), patch.object(checker, "relay_client", return_value=relay), patch.object(checker, "_call_relay", call_relay), patch.object(checker, "replay", replay):
@@ -78,6 +78,76 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["cost_relay"], round(cost_of(MODEL, USAGE) * 2, 6))
         self.assertEqual(record["cost_official"], round(cost_of(MODEL, USAGE), 6))
         self.assertEqual(record["negative"], {})
+
+    async def test_reasoning_extraction_refusal_runs_replay_and_preserves_followup(self):
+        for stream in (False, True):
+            for content in ([], [{"type": "text", "text": "我无法提供思考过程。"}]):
+                with self.subTest(stream=stream, content=content):
+                    response = message(content, "refusal")
+                    response["stop_details"] = {"type": "refusal", "category": "reasoning_extraction"}
+                    response["usage"] = {"input_tokens": 250, "output_tokens": 20}
+                    record, stored, call_relay, replay = await self.run_flow(response, stream=stream)
+                    self.assertEqual(record["verdict"], "pass")
+                    self.assertEqual(call_relay.await_count, 2)
+                    self.assertEqual([call.args[2] for call in call_relay.await_args_list], [stream, stream])
+                    replay.assert_awaited_once()
+                    self.assertEqual(replay.await_args.args[2], stored[0]["mint"]["challenge"])
+                    self.assertEqual(replay.await_args.args[3], ASSISTANT)
+                    relevance = stored[0]["relevance"]
+                    # 拒绝仅放行官方校验，不能记录成模型已回答“是”。
+                    self.assertTrue(relevance["ok"])
+                    self.assertEqual(relevance["kind"], "reasoning_extraction_refusal")
+                    self.assertIsNone(relevance["related"])
+                    self.assertEqual(relevance["answer"], "" if not content else content[0]["text"])
+                    self.assertEqual(relevance["response"], response)
+                    self.assertEqual(relevance["usage"], response["usage"])
+                    self.assertEqual(relevance["request_id"], "req_followup")
+                    self.assertEqual(stored[0]["replay"]["verdict"], "pass")
+                    self.assertEqual(record["cost_relay"], round(cost_of(MODEL, USAGE) + cost_of(MODEL, response["usage"]), 6))
+                    self.assertEqual(record["cost_official"], round(cost_of(MODEL, USAGE), 6))
+
+    async def test_reasoning_extraction_refusal_keeps_official_forged_verdict(self):
+        response = message([], "refusal")
+        response["stop_details"] = {"type": "refusal", "category": "reasoning_extraction"}
+        replay_result = {"ok": False, "status": 400, "error": "Invalid signature in thinking block"}
+        record, stored, call_relay, replay = await self.run_flow(response, replay_result=replay_result)
+        replay.assert_awaited_once()
+        self.assertEqual(call_relay.await_count, 2)
+        self.assertEqual((record["verdict"], record["reason"]), ("forged", "forged"))
+        self.assertEqual((stored[0]["verdict"], stored[0]["reason"]), ("forged", "forged"))
+        self.assertEqual(stored[0]["replay"]["error"], replay_result["error"])
+        self.assertEqual(stored[0]["relevance"]["kind"], "reasoning_extraction_refusal")
+
+    async def test_other_refusals_and_invalid_metadata_never_call_official(self):
+        response = message([{"type": "text", "text": "refusal reasoning_extraction"}], "refusal")
+        responses = [response]
+        responses.extend({**response, "stop_details": details} for details in (
+            {"type": "refusal", "category": "other"},
+            {"type": "other", "category": "reasoning_extraction"},
+            {"type": "refusal"}, {}, None, [], "reasoning_extraction",
+        ))
+        for followup in responses:
+            with self.subTest(stop_details=followup.get("stop_details", "missing")):
+                record, stored, call_relay, replay = await self.run_flow(followup)
+                replay.assert_not_awaited()
+                self.assertEqual(call_relay.await_count, 2)
+                self.assertEqual((record["verdict"], record["reason"]), ("undetectable", "relevance_unconfirmed"))
+                self.assertFalse(stored[0]["relevance"]["ok"])
+                self.assertEqual(stored[0]["relevance"]["response"], followup)
+                self.assertEqual(stored[0]["replay"], {})
+                self.assertEqual(record["cost_relay"], round(cost_of(MODEL, USAGE) * 2, 6))
+                self.assertEqual(record["cost_official"], 0)
+
+    async def test_reasoning_extraction_refusal_does_not_bypass_invalid_text(self):
+        response = message([{"type": "text", "text": None}], "refusal")
+        response["stop_details"] = {"type": "refusal", "category": "reasoning_extraction"}
+        record, stored, _, replay = await self.run_flow(response)
+        replay.assert_not_awaited()
+        self.assertEqual((record["verdict"], record["reason"]), ("undetectable", "unsupported_format"))
+        self.assertEqual(stored[0]["relevance"]["response"], response)
+        self.assertEqual(stored[0]["relevance"]["usage"], USAGE)
+        self.assertEqual(record["cost_relay"], round(cost_of(MODEL, USAGE) * 2, 6))
+        self.assertEqual(record["cost_official"], 0)
 
     async def test_unconfirmed_replies_never_call_official(self):
         # “不是”包含“是”，不能用子串判断；被截断的“是”也不算完整确认。

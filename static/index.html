@@ -418,7 +418,8 @@
           <div class="flow-step">
             <div class="h"><span class="n">2</span>中转站相关性追问
               <span class="grow"></span>
-              <span v-if="rd.relevance?.question" class="chip" :class="rd.relevance.ok ? 'ok' : 'bad'">{{ rd.relevance.ok ? '是' : rd.relevance.related === false ? '签名复用' : '未确认' }}</span>
+              <span v-if="rd.relevance?.question && rd.relevance.kind === 'reasoning_extraction_refusal'" class="chip warn">拒绝提取思考，继续回放</span>
+              <span v-else-if="rd.relevance?.question" class="chip" :class="rd.relevance.ok ? 'ok' : 'bad'">{{ rd.relevance.ok ? '是' : rd.relevance.related === false ? '签名复用' : '未确认' }}</span>
               <span v-else class="chip">未执行</span></div>
             <template v-if="rd.relevance?.question">
               <dl>

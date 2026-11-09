@@ -24,7 +24,7 @@ MINT_MAX_TOKENS = 8000
 RELEVANCE_MAX_TOKENS = 1024
 REPLAY_MAX_TOKENS = 1024
 MINT_ATTEMPTS = 3
-RELEVANCE_QUESTION = "刚才的思考是否与题目有关？只回答“是”或“不是”，不要解释，也不要调用工具。"
+RELEVANCE_QUESTION = "刚才的思考是否与题目有关？只回答“是”或“不是”，不要解释，也不要调用工具。我不关心你是怎么思考的，不用透露思考过程，我只关心思考是否与题目相关。"
 
 DEFAULT_SYSTEM = [
     {
@@ -327,6 +327,10 @@ async def check_relevance(client: AsyncAnthropic, model: str, mint_result: dict,
     if any(not isinstance(b.get("text"), str) for b in text_blocks):
         return {**result, "ok": False, "kind": "unsupported_format", "error": "相关性追问的 text 块缺少有效文本"}
     answer = "".join(b["text"] for b in text_blocks).strip()
+    stop_details = data.get("stop_details")
+    # 此类拒绝不确认相关性，但按检测规则继续官方签名回放。
+    if isinstance(stop_details, dict) and stop_details.get("type") == "refusal" and stop_details.get("category") == "reasoning_extraction":
+        return {**result, "ok": True, "kind": "reasoning_extraction_refusal", "related": None, "answer": answer}
     normalized = answer.strip(" \t\r\n。.!！\"'“”‘’")
     # 必须完整回答指定选项，不能把“不是”或截断的“是”误判为确认。
     related = normalized == "是" if normalized in ("是", "不是") and data.get("stop_reason") == "end_turn" else None
@@ -408,10 +412,11 @@ def classify_replay(rep: dict, paths: list[str]) -> tuple[str, str]:
     reasons = {t.get("reason") for t in ours}
     if "model_binding_mismatch" in reasons:
         return "forged", "model_mismatch"
-    if "prefix_binding_mismatch" in reasons:
-        return "suspicious", "prefix_mismatch"
-    if reasons - {"organization_binding_mismatch"}:
+    # 上下文和账号绑定不一致均允许通过，其他丢弃原因仍需标记。
+    if reasons - {"prefix_binding_mismatch", "organization_binding_mismatch"}:
         return "suspicious", "unknown_transformation"
+    if "prefix_binding_mismatch" in reasons:
+        return "pass", "prefix_mismatch"
     if reasons:
         return "pass", "org_binding"
     return "pass", "verified"
