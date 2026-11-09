@@ -20,6 +20,10 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.init()
+    # 仅迁移曾保存的旧默认提示，避免普通对话仍被要求调用工具。
+    old_system = [{"type": "text", "text": "You are a precise calculator. Work the problem out carefully, then report the final result by calling the submit_answer tool."}]
+    if db.get_setting("system", None) == old_system:
+        db.set_setting("system", checker.DEFAULT_SYSTEM)
     runner.recover_interrupted()
     yield
 

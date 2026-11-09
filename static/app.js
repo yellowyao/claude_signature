@@ -345,7 +345,7 @@ const app = createApp({
       c.push(h.thinking_text_nonempty
         ? { warn: true, t: 'thinking 文本非空（官方默认为空）' }
         : { ok: true, t: 'thinking 文本为空（符合默认）' });
-      c.push({ ok: h.has_tool_use, warn: !h.has_tool_use, t: h.has_tool_use ? '按要求调用了工具' : '未调用工具' });
+      if (h.has_tool_use !== null && h.has_tool_use !== undefined) c.push({ ok: h.has_tool_use, warn: !h.has_tool_use, t: h.has_tool_use ? '按要求调用了工具' : '未调用工具' });
       if (h.answer_correct !== null && h.answer_correct !== undefined) c.push({ ok: h.answer_correct, t: h.answer_correct ? '计算结果正确' : '计算结果错误' });
       if (h.nonce_ok !== null && h.nonce_ok !== undefined) c.push({ ok: h.nonce_ok, t: h.nonce_ok ? '验证编号一致' : '验证编号不一致' });
       if (h.latency_ms) c.push({ t: `耗时 ${(h.latency_ms / 1000).toFixed(1)}s` });

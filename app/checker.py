@@ -1,8 +1,8 @@
 """Mint a thinking block, ask the relay about relevance, then replay it to the official API.
 
-Mint: ask the model a small reasoning puzzle with one tool available, so the reply is
-`thinking + tool_use`. Replay: send [user, assistant(as returned), user(tool_result)] to the
-official API with the same system/tools/first message (the signature is bound to that prefix),
+Mint: ask the model a small reasoning puzzle and request a normal text answer alongside
+the signed thinking. Replay: send [user, assistant, user] to the official API with the
+same system/first message (the signature is bound to that prefix),
 plus the thinking-binding-controls beta so the response reports dropped blocks and why.
 """
 
@@ -24,31 +24,15 @@ MINT_MAX_TOKENS = 8000
 RELEVANCE_MAX_TOKENS = 1024
 REPLAY_MAX_TOKENS = 1024
 MINT_ATTEMPTS = 3
-RELEVANCE_QUESTION = "刚才的思考是否与题目有关？只回答“是”或“不是”，不要解释，也不要调用工具。我不关心你是怎么思考的，不用透露思考过程，我只关心思考是否与题目相关。"
+RELEVANCE_QUESTION = "刚才的思考是否与题目有关？只回答“是”或“不是”，不要解释。我不关心你是怎么思考的，不用透露思考过程，我只关心思考是否与题目相关。"
 
 DEFAULT_SYSTEM = [
     {
         "type": "text",
         "text": (
             "You are a precise calculator. Work the problem out carefully, "
-            "then report the final result by calling the submit_answer tool."
+            "then report the final result and the verification nonce in plain text."
         ),
-    }
-]
-
-TOOLS = [
-    {
-        "name": "submit_answer",
-        "description": "Submit the final integer answer together with the verification nonce.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "answer": {"type": "integer", "description": "The final integer result."},
-                "nonce": {"type": "string", "description": "The verification nonce, copied verbatim."},
-            },
-            "required": ["answer", "nonce"],
-            "additionalProperties": False,
-        },
     }
 ]
 
@@ -125,7 +109,7 @@ def new_challenge() -> dict:
     nonce = secrets.token_hex(4).upper()
     prompt = (
         f"验证编号 {nonce}。请计算 ({a}^3 + {b}^2) mod {m} 的值。"
-        f"仔细计算后调用 submit_answer 工具提交：answer 为整数结果，nonce 为验证编号原样。"
+        "仔细计算后直接用文字回答整数结果，并原样附上验证编号。"
     )
     return {"nonce": nonce, "prompt": prompt, "expected": (a**3 + b**2) % m}
 
@@ -198,8 +182,6 @@ async def mint(client: AsyncAnthropic, model: str, stream: bool, system: list[di
             model=model,
             max_tokens=MINT_MAX_TOKENS,
             system=system,
-            tools=TOOLS,
-            tool_choice={"type": "auto"},
             thinking={"type": "adaptive"},
             messages=first_messages(challenge),
         )
@@ -238,7 +220,7 @@ async def mint(client: AsyncAnthropic, model: str, stream: bool, system: list[di
         result["usages"].append(data.get("usage") or {})
         blocks = [b for b in data["content"] if isinstance(b, dict) and b.get("type") in THINKING_TYPES]
         result.update(challenge=challenge, raw=data, latency_ms=latency_ms, request_id=request_id,
-                      params={k: v for k, v in params.items() if k not in ("system", "tools", "messages")})
+                      params={k: v for k, v in params.items() if k not in ("system", "messages")})
         if not blocks:
             continue  # adaptive thinking skipped this time; try a fresh challenge
         signed = [b for b in blocks if b.get("signature") or b.get("data")]
@@ -257,7 +239,7 @@ async def mint(client: AsyncAnthropic, model: str, stream: bool, system: list[di
 
 
 def sanitize_content(content: list) -> list[dict]:
-    """Rebuild the assistant turn from known fields only; relays sometimes add extra keys."""
+    """Keep thinking and text blocks only; relays sometimes add extra keys or tool calls."""
     out = []
     for b in content:
         if not isinstance(b, dict):
@@ -270,8 +252,6 @@ def sanitize_content(content: list) -> list[dict]:
         elif t == "text":
             if b.get("text"):
                 out.append({"type": "text", "text": b["text"]})
-        elif t == "tool_use":
-            out.append({"type": "tool_use", "id": b["id"], "name": b["name"], "input": b.get("input") or {}})
     return out
 
 
@@ -280,14 +260,7 @@ def thinking_paths(assistant: list[dict]) -> list[str]:
 
 
 def replay_messages(challenge: dict, assistant: list[dict], question: str | None = None) -> list[dict]:
-    tool_ids = [b["id"] for b in assistant if b["type"] == "tool_use"]
-    if tool_ids:
-        follow = [{"type": "tool_result", "tool_use_id": tid, "content": "已收到。"} for tid in tool_ids]
-        if question:
-            # 工具结果必须放在前面，随后才能追加本轮追问。
-            follow.append({"type": "text", "text": question})
-    else:
-        follow = question or "已收到，请用一句话确认结果。"
+    follow = question or "已收到，请用一句话确认结果。"
     return [*first_messages(challenge), {"role": "assistant", "content": assistant}, {"role": "user", "content": follow}]
 
 
@@ -296,15 +269,13 @@ async def check_relevance(client: AsyncAnthropic, model: str, mint_result: dict,
         model=model,
         max_tokens=RELEVANCE_MAX_TOKENS,
         system=system,
-        tools=TOOLS,
-        tool_choice={"type": "none"},
         thinking={"type": "adaptive"},
         messages=replay_messages(mint_result["challenge"], assistant, RELEVANCE_QUESTION),
     )
     if "output_config" in mint_result["params"]:
         params["output_config"] = {"effort": "low"}
     result = {"question": RELEVANCE_QUESTION,
-              "params": {k: v for k, v in params.items() if k not in ("system", "tools", "messages")}}
+              "params": {k: v for k, v in params.items() if k not in ("system", "messages")}}
     started = time.perf_counter()
     try:
         data, request_id = await _call_relay(client, params, stream)
@@ -343,8 +314,6 @@ async def replay(client: AsyncAnthropic, model: str, challenge: dict, assistant:
         model=model,
         max_tokens=REPLAY_MAX_TOKENS,
         system=system,
-        tools=TOOLS,
-        tool_choice={"type": "auto"},
         thinking={"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}},
         output_config={"effort": "low"},
         messages=replay_messages(challenge, assistant),
@@ -437,12 +406,8 @@ def heuristics(m: dict, requested_model: str) -> dict:
     data = m.get("raw") or {}
     content = data.get("content") or []
     thinking = [b for b in content if isinstance(b, dict) and b.get("type") == "thinking"]
-    tool = next((b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"), None)
     usage = data.get("usage") or {}
     sig = thinking[0].get("signature", "") if thinking else ""
-    answer = (tool or {}).get("input", {}).get("answer") if tool else None
-    nonce = (tool or {}).get("input", {}).get("nonce") if tool else None
-    challenge = m.get("challenge") or {}
     return {
         "id": data.get("id"),
         "id_prefix_ok": str(data.get("id", "")).startswith("msg_"),
@@ -456,9 +421,6 @@ def heuristics(m: dict, requested_model: str) -> dict:
         "signature_len": len(sig),
         "signature_b64": _is_b64(sig) if sig else None,
         "thinking_text_nonempty": any(b.get("thinking") for b in thinking),
-        "has_tool_use": tool is not None,
-        "answer_correct": (answer == challenge.get("expected")) if tool else None,
-        "nonce_ok": (nonce == challenge.get("nonce")) if tool else None,
         "latency_ms": m.get("latency_ms"),
         "attempts": m.get("attempts"),
     }
